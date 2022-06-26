@@ -657,9 +657,11 @@ static int _run_server(int epl_fd, struct server_state *state)
 
 	ret = epoll_wait(epl_fd, events, NR_EPOLL_EVT, 1000);
 	if (unlikely(ret < 0)) {
-		ret = -errno;
+		ret = errno;
 		perror("epoll_wait");
-		return ret;
+		if (ret == EINTR)
+			return 0;
+		return -ret;
 	}
 
 	for (i = 0; i < ret; i++) {
