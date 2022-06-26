@@ -647,9 +647,7 @@ int main(int argc, char *argv[])
 		return ret;
 	}
 
-	ret = mlock(state, sizeof(*state));
-	if (ret < 0)
-		perror("mlock");
+	mlock(state, sizeof(*state));
 #endif
 
 	g_state = state;
