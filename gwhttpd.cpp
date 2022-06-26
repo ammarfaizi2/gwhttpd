@@ -142,6 +142,7 @@ static int init_socket(struct server_state *state, const char *addr,
 	}
 
 	memset(&saddr, 0, sizeof(saddr));
+	saddr.sin_family = AF_INET;
 	saddr.sin_port = htons(port);
 	saddr.sin_addr.s_addr = inet_addr(addr);
 
