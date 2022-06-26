@@ -498,8 +498,10 @@ static int _handle_client(struct client_sess *sess, struct server_state *state)
 	sess->buf[sess->buf_size] = '\0';
 	if (!sess->got_http_header) {
 		ret = parse_http_header(sess);
-		if (ret)
+		if (ret) {
 			send_error_and_close(400, sess, state);
+			return 0;
+		}
 		if (!sess->got_http_header)
 			return 0;
 	}
