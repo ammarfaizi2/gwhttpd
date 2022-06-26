@@ -312,10 +312,14 @@ static int handle_new_client(struct server_state *state)
 static ssize_t send_to_client(struct client_sess *sess, const char *buf,
 			      size_t len)
 {
+	constexpr uint32_t max_try = 10;
+	uint32_t try_count = 0;
 	ssize_t ret;
 	int tmp;
 
 repeat:
+	if (unlikely(try_count++ >= max_try))
+		return -ENETDOWN;
 	ret = send(sess->fd, buf, len, MSG_DONTWAIT);
 	if (unlikely(ret < 0)) {
 		tmp = errno;
