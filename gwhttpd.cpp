@@ -13,12 +13,16 @@
 #include <unistd.h>
 #include <cerrno>
 #include <stack>
+#include <queue>
 #include <mutex>
+#include <dirent.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #define likely(COND)		__builtin_expect(!!(COND), 1)
 #define unlikely(COND)		__builtin_expect(!!(COND), 0)
@@ -59,6 +63,8 @@ struct server_state {
 	struct epoll_event	events[NR_EPOLL_EVT];
 	std::mutex		*sfi_lock;
 	std::stack<uint32_t>	*sess_free_idx;
+	std::mutex		*bq_lock;
+	std::queue<uint32_t>	*buf_queue;
 	struct client_sess	sess[NR_MAX_CLIENTS];
 
 	/*
@@ -105,15 +111,26 @@ static int init_state(struct server_state *state)
 
 	state->sfi_lock = new std::mutex;
 	if (!state->sfi_lock) {
-		fprintf(stderr, "Cannot allocate mutex\n");
+		fprintf(stderr, "Cannot allocate sfi_lock\n");
 		return -ENOMEM;
+	}
+
+	state->bq_lock = new std::mutex;
+	if (!state->sfi_lock) {
+		fprintf(stderr, "Cannot allocate bq_lock\n");
+		goto out_err_bq_lock;
 	}
 
 	state->sess_free_idx = new __typeof__(*state->sess_free_idx);
 	if (!state->sess_free_idx) {
 		fprintf(stderr, "Cannot allocate sess_free_idx\n");
-		delete state->sfi_lock;
-		return -ENOMEM;
+		goto out_err_sess_free_idx;
+	}
+
+	state->buf_queue = new __typeof__(*state->buf_queue);
+	if (!state->buf_queue) {
+		fprintf(stderr, "Cannot allocate buf_queue\n");
+		goto out_err_buf_queue;
 	}
 
 	for (i = NR_MAX_CLIENTS - 1; i--; ) {
@@ -123,6 +140,14 @@ static int init_state(struct server_state *state)
 	}
 
 	return 0;
+
+out_err_buf_queue:
+	delete state->sess_free_idx;
+out_err_sess_free_idx:
+	delete state->bq_lock;
+out_err_bq_lock:
+	delete state->sfi_lock;
+	return -ENOMEM;
 }
 
 static int init_socket(struct server_state *state, const char *addr,
@@ -472,88 +497,225 @@ static void close_sess(struct client_sess *sess, struct server_state *state)
 	put_sess_idx(sess->idx, state);
 }
 
-#define HTTP_200_HTML "HTTP/1.1 200\r\nContent-Type: text/html\r\n\r\n"
-#define HTTP_200_TEXT "HTTP/1.1 200\r\nContent-Type: text/plain\r\n\r\n"
-
-static int route_show_index(struct client_sess *sess,
-			    struct server_state *state)
+static int construct_file_list(char *buf, ssize_t buf_size, const char *path,
+			       const char *file)
 {
-	static const char buf[] =
-		HTTP_200_HTML
-		"<!DOCTYPE html>"
-		"<html>"
-			"<body>"
-				"<h1>This is the index!</h1>"
-			"</body>"
-		"</html>";
+	char pathname[4352];
+	const char *ftype;
+	struct stat st;
+	int ret;
 
-	send_to_client(sess, buf, sizeof(buf) - 1);
+	if (buf_size < 0)
+		return -EOVERFLOW;
+
+	snprintf(pathname, sizeof(pathname), "%s/%s", path, file);
+
+	ret = stat(pathname, &st);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		fprintf(stderr, "Cannot open \"%s\": %s\n", pathname,
+			strerror(ret));
+		return -ret;
+	}
+
+	if (st.st_mode & S_IFDIR)
+		ftype = "Directory";
+	else if (st.st_mode & S_IFREG)
+		ftype = "Regular File";
+	else
+		return -ENOTSUP;
+
+	ret = snprintf(
+		buf,
+		buf_size,
+		"\t\t<tr>"
+			"<td><a href=\"%s%s\">%s</a></td>"
+			"<td>%s</td>"
+			"<td>%d%d%d%d</td>"
+		"</tr>\n",
+		file, (st.st_mode & S_IFDIR) ? "/" : "", file,
+		ftype,
+		(st.st_mode & 07000) >> 9,
+		(st.st_mode & 00700) >> 6,
+		(st.st_mode & 00070) >> 3,
+		(st.st_mode & 00007)
+	);
+	if (ret > buf_size)
+		return buf_size - 1;
+
+	return ret;
+}
+
+static int show_directory_listing(const char *path, struct client_sess *sess,
+				  struct server_state *state)
+{
+	char buf[1024 * 1024 * 4] = { };
+	ssize_t buf_size;
+	DIR *dr;
+	char *p;
+	int ret;
+
+	dr = opendir(path);
+	if (unlikely(!dr)) {
+		ret = errno;
+		perror("opendir");
+		return -ret;
+	}
+
+	buf_size = sizeof(buf);
+	p = buf;
+
+	ret = snprintf(p, buf_size,
+			"HTTP/1.1 200\r\n"
+			"Content-Type: text/html\r\n\r\n"
+			"<!DOCTYPE html>\n"
+			"<html>\n"
+			"<style type=\"text/css\">"
+				"td {padding: 10px;}"
+				"a {color: blue; text-decoration: none}"
+				"a:hover {text-decoration: underline}"
+			"</style>"
+			"<body>\n"
+			"\t<h1>GNU/Weeb HTTP Server</h1>\n"
+			"\t<table border=\"1\">\n"
+			"\t\t<tr>"
+				"<th>Filename</th>"
+				"<th>Type</th>"
+				"<th>Mode</th>"
+			"</tr>\n");
+
+	p += ret;
+	buf_size -= ret;
+
+	ret = construct_file_list(p, buf_size, path, ".");
+	if (ret > 0) {
+		p += ret;
+		buf_size -= ret;
+	}
+
+	ret = construct_file_list(p, buf_size, path, "..");
+	if (ret > 0) {
+		p += ret;
+		buf_size -= ret;
+	}
+
+	while (1) {
+		struct dirent *de;
+		const char *f;
+
+		de = readdir(dr);
+		if (!de)
+			break;
+
+		f = de->d_name;
+		if (!strcmp(f, ".") || !strcmp(f, ".."))
+			continue;
+
+		ret = construct_file_list(p, buf_size - 128, path, f);
+		if (ret > 0) {
+			p += ret;
+			buf_size -= ret;
+		}
+	}
+	closedir(dr);
+	ret = snprintf(p, buf_size, "\t</table>\n</body>\n</html>\n");
+	buf_size -= ret;
+	send_to_client(sess, buf, sizeof(buf) - buf_size);
 	close_sess(sess, state);
 	return 0;
 }
 
-static int route_show_hello(struct client_sess *sess,
-			    struct server_state *state)
+static int http_redirect(struct client_sess *sess, const char *location)
 {
-	static const char buf[] =
-		HTTP_200_HTML
-		"<!DOCTYPE html>"
-		"<html>"
-			"<body>"
-				"<h1>Hello World!</h1>"
-			"</body>"
-		"</html>";
+	char buf[4096 + 4096 + 256];
+	int len;
 
-	send_to_client(sess, buf, sizeof(buf) - 1);
-	close_sess(sess, state);
+	len = snprintf(buf, sizeof(buf),
+			"HTTP/1.1 302\r\n"
+			"Location: %s\r\n\r\nYou are redirected to %s\n\n",
+			location, location);
+
+	return send_to_client(sess, buf, (size_t)len);
+}
+
+static int __handle_route_get(struct client_sess *sess,
+			      struct server_state *state)
+{
+	char pathname[4096];
+	struct stat st;
+	int ret;
+
+	snprintf(pathname, sizeof(pathname), "./%s", sess->uri);
+
+	ret = stat(pathname, &st);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		fprintf(stderr, "Cannot open \"%s\": %s\n", pathname,
+			strerror(ret));
+		return -ret;
+	}
+
+	if (st.st_mode & S_IFDIR) {
+
+		if (sess->uri[strlen(sess->uri) - 1] != '/') {
+			char *redirect = pathname;
+
+			snprintf(redirect, sizeof(pathname), "%s/",
+				 sess->uri);
+			http_redirect(sess, redirect);
+			close_sess(sess, state);
+			return 0;
+		}
+
+		/*
+		 * This is a directory! Do a directory listing here...
+		 */
+		return show_directory_listing(pathname, sess, state);
+	}
+
+	if (st.st_mode & S_IFREG) {
+		/*
+		 * This is a regular file! Send to client...
+		 */
+	}
+
+	return -ENOTSUP;
+}
+
+static int _handle_route_get(struct client_sess *sess,
+			     struct server_state *state)
+{
+	int ret;
+
+	/*
+	 * Don't allow to step up to the parent directory.
+	 */
+	if (unlikely(strstr(sess->uri, "/..")))
+		return -ENOENT;
+
+	ret = __handle_route_get(sess, state);
+	if (ret)
+		return -ENOENT;
+
 	return 0;
 }
 
 static int handle_route_get(struct client_sess *sess,
 			    struct server_state *state)
 {
-	const char *uri = sess->uri;
+	int ret;
 
-	if (!strcmp(uri, "/"))
-		return route_show_index(sess, state);
-	if (!strcmp(uri, "/hello"))
-		return route_show_hello(sess, state);
+	ret = _handle_route_get(sess, state);
+	if (!ret)
+		return 0;
 
-	send_http_error(404, sess);
-	close_sess(sess, state);
-	return 0;
-}
+	if (ret == -ENOENT) {
+		send_http_error(404, sess);
+		close_sess(sess, state);
+		return 0;
+	}
 
-static int route_show_echo(struct client_sess *sess, struct server_state *state)
-{
-	char buf[4096] = HTTP_200_TEXT;
-	constexpr size_t max_body_len = sizeof(buf) - sizeof(HTTP_200_TEXT);
-
-	size_t header_size = (size_t)(sess->body - sess->buf);
-	size_t body_len = sess->buf_size - header_size;
-	size_t send_len;
-
-	if (body_len > max_body_len)
-		body_len = max_body_len;
-
-	send_len = body_len + sizeof(HTTP_200_TEXT) - 1;
-	memcpy(&buf[sizeof(HTTP_200_TEXT) - 1], sess->body, body_len);
-	send_to_client(sess, buf, send_len);
-	close_sess(sess, state);
-	return 0;
-}
-
-static int handle_route_post(struct client_sess *sess,
-			     struct server_state *state)
-{
-	const char *uri = sess->uri;
-
-	if (!strcmp(uri, "/echo"))
-		return route_show_echo(sess, state);
-
-	send_http_error(404, sess);
-	close_sess(sess, state);
-	return 0;
+	return ret;
 }
 
 static int handle_route(struct client_sess *sess, struct server_state *state)
@@ -565,8 +727,9 @@ static int handle_route(struct client_sess *sess, struct server_state *state)
 		ret = handle_route_get(sess, state);
 		break;
 	case HTTP_POST:
-		ret = handle_route_post(sess, state);
-		break;
+	case HTTP_DELETE:
+	case HTTP_PATCH:
+	case HTTP_PUT:
 	default:
 		send_http_error(405, sess);
 		close_sess(sess, state);
@@ -702,7 +865,9 @@ static void destroy_state(struct server_state *state)
 			close(fd);
 	}
 
+	delete state->buf_queue;
 	delete state->sess_free_idx;
+	delete state->bq_lock;
 	delete state->sfi_lock;
 #ifdef USE_ASAN
 	delete state;
@@ -733,7 +898,7 @@ int main(int argc, char *argv[])
 	state = new struct server_state;
 	if (!state) {
 		perror("malloc");
-		return ret;
+		return ENOMEM;
 	}
 #else
 	state = (struct server_state *)mmap(NULL, sizeof(*state),
