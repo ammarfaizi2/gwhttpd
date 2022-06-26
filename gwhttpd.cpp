@@ -67,6 +67,8 @@ static struct server_state *g_state;
 
 static void interrupt_handler(int sig)
 {
+	putchar('\n');
+	printf("Got signal: %d\n", sig);
 	if (!g_state)
 		return;
 
