@@ -111,6 +111,7 @@ static int init_state(struct server_state *state)
 	}
 
 	for (i = NR_MAX_CLIENTS - 1; i--; ) {
+		state->sess[i].fd = -1;
 		state->sess[i].idx = i;
 		state->sess_free_idx->push(i);
 	}
