@@ -30,7 +30,10 @@
 
 enum http_method {
 	HTTP_GET,
-	HTTP_POST
+	HTTP_POST,
+	HTTP_PATCH,
+	HTTP_PUT,
+	HTTP_DELETE,
 };
 
 struct client_sess {
@@ -39,6 +42,7 @@ struct client_sess {
 	char			buf[4096];
 	enum http_method	method;
 	char			*uri;
+	char			*qs;
 	char			*http_ver;
 	char			*body;
 	bool			got_http_header;
@@ -305,48 +309,6 @@ static int handle_new_client(struct server_state *state)
 	return 0;
 }
 
-static int parse_http_header(struct client_sess *sess)
-{
-	char *tmp;
-
-	/*
-	 * CRLF = Carriage Return, Line Feed.
-	 */
-	tmp = strstr(sess->buf, "\r\n\r\n");
-	if (!tmp)
-		return 0;
-
-	sess->body = tmp + 4;
-	if (!strncmp(sess->buf, "GET", sizeof("GET") - 1)) {
-		sess->method = HTTP_GET;
-		sess->uri = &sess->buf[sizeof("GET")];
-	} else if (!strncmp(sess->buf, "POST", sizeof("POST") - 1)) {
-		sess->method = HTTP_POST;
-		sess->uri = &sess->buf[sizeof("POST")];
-	} else {
-		return -EBADMSG;
-	}
-
-	sess->http_ver = strstr(sess->uri, " ");
-	if (!sess->http_ver)
-		return -EBADMSG;
-
-	sess->http_ver[0] = '\0';
-	tmp = strstr(++sess->http_ver, "\r\n");
-	tmp[0] = '\0';
-	sess->got_http_header = true;
-	return 0;
-}
-
-static void close_sess(struct client_sess *sess, struct server_state *state)
-{
-	printf("Closing session " FCIP " (idx = %u)\n", FCIP_ARG(sess),
-		sess->idx);
-	delete_client(state->epl_fd, sess);
-	close(sess->fd);
-	put_sess_idx(sess->idx, state);
-}
-
 static ssize_t send_to_client(struct client_sess *sess, const char *buf,
 			      size_t len)
 {
@@ -382,6 +344,128 @@ static void send_http_error(int code, struct client_sess *sess)
 			"HTTP Error %d",
 			code, code);
 	send_to_client(sess, buf, (size_t)tmp);
+}
+
+static char *parse_http_method(char *buf, enum http_method *method_p)
+{
+	if (!strncmp("GET ", buf, sizeof("GET"))) {
+		*method_p = HTTP_GET;
+		return buf + sizeof("GET");
+	}
+
+	if (!strncmp("POST ", buf, sizeof("POST"))) {
+		*method_p = HTTP_POST;
+		return buf + sizeof("POST");
+	}
+
+	if (!strncmp("PUT ", buf, sizeof("PUT"))) {
+		*method_p = HTTP_PUT;
+		return buf + sizeof("PUT");
+	}
+
+	if (!strncmp("PATCH ", buf, sizeof("PATCH"))) {
+		*method_p = HTTP_PATCH;
+		return buf + sizeof("PATCH");
+	}
+
+	if (!strncmp("DELETE ", buf, sizeof("DELETE"))) {
+		*method_p = HTTP_DELETE;
+		return buf + sizeof("DELETE");
+	}
+
+	return NULL;
+}
+
+static char *parse_query_string(char *uri, char *end_uri)
+{
+	while (uri < end_uri) {
+		if (*uri++ != '?')
+			continue;
+		if (uri == end_uri)
+			/*
+			 * We got an empty query string:
+			 *  "http://somehwere.com/path?"
+			 */
+			return NULL;
+		return uri;
+	}
+	return NULL;
+}
+
+static int parse_http_header(struct client_sess *sess)
+{
+	char *buf = sess->buf;
+	char *end;
+	char *ret;
+
+	/*
+	 * Split the HTTP header and HTTP body.
+	 */
+	ret = strstr(buf, "\r\n\r\n");
+	if (!ret) {
+		/*
+		 * If we fail here, we may got a partial packet.
+		 * Don't fail here if still have enough buffer,
+		 * we will wait for the next recv() iteration.
+		 */
+		if (sess->buf_size >= sizeof(sess->buf) - 1)
+			goto bad_req;
+
+		return 0;
+	}
+	end = ret;
+
+	/*
+	 * The HTTP body is located right after "\r\n\r\n".
+	 */
+	sess->body = &ret[4];
+
+	ret = parse_http_method(buf, &sess->method);
+	if (unlikely(!ret))
+		goto bad_req;
+
+	/*
+	 * Now @ret is pointing to URI. For example:
+	 *
+	 *  "GET / HTTP/1.1"
+	 *       ^
+	 *     @ret
+	 */
+	sess->uri = ret;
+	ret = strstr(sess->uri, " ");
+	if (unlikely(!ret))
+		goto bad_req;
+
+	ret[0] = '\0';
+	if (unlikely(&ret[1] >= end))
+		goto bad_req;
+
+	sess->qs = parse_query_string(sess->uri, end);
+	ret = strstr(&ret[1], "HTTP/");
+	if (unlikely(!ret))
+		goto bad_req;
+
+	sess->http_ver = ret;
+	ret = strstr(sess->http_ver, "\r\n");
+	if (unlikely(!ret))
+		goto bad_req;
+
+	ret[0] = '\0';
+	sess->got_http_header = true;
+	return 0;
+
+bad_req:
+	send_http_error(400, sess);
+	return -EBADMSG;
+}
+
+static void close_sess(struct client_sess *sess, struct server_state *state)
+{
+	printf("Closing session " FCIP " (idx = %u)\n", FCIP_ARG(sess),
+		sess->idx);
+	delete_client(state->epl_fd, sess);
+	close(sess->fd);
+	put_sess_idx(sess->idx, state);
 }
 
 #define HTTP_200_HTML "HTTP/1.1 200\r\nContent-Type: text/html\r\n\r\n"
@@ -495,15 +579,20 @@ static int _handle_client(struct client_sess *sess, struct server_state *state)
 	sess->buf[sess->buf_size] = '\0';
 	if (!sess->got_http_header) {
 		ret = parse_http_header(sess);
-		if (ret) {
-			send_http_error(400, sess);
-			return 0;
-		}
+		if (ret)
+			goto out;
 		if (!sess->got_http_header)
 			return 0;
 	}
 
+#if 0
+	printf("URI: %s\n", sess->uri);
+	printf("Query String: %s\n", sess->qs);
+	printf("HTTP version: %s\n", sess->http_ver);
+#endif
+
 	ret = handle_route(sess, state);
+out:
 	if (ret) {
 		close_sess(sess, state);
 		if (likely(ret == -EBADMSG || ret == -ENETDOWN))
