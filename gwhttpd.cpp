@@ -369,22 +369,17 @@ repeat:
 	return ret;
 }
 
-static void send_error_and_close(int code, struct client_sess *sess,
-				 struct server_state *state)
+static void send_http_error(int code, struct client_sess *sess)
 {
 	char buf[128];
-	ssize_t ret;
 	int tmp;
 
 	tmp = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 %d\r\n"
 			"Content-Type: text/plain\r\n\r\n"
-			"Error %d",
+			"HTTP Error %d",
 			code, code);
-
-	ret = send_to_client(sess, buf, (size_t)tmp);
-	if (ret < 0)
-		close_sess(sess, state);
+	send_to_client(sess, buf, (size_t)tmp);
 }
 
 #define HTTP_200_HTML "HTTP/1.1 200\r\nContent-Type: text/html\r\n\r\n"
@@ -434,7 +429,8 @@ static int handle_route_get(struct client_sess *sess,
 	if (!strcmp(uri, "/hello"))
 		return route_show_hello(sess, state);
 
-	send_error_and_close(404, sess, state);
+	send_http_error(404, sess);
+	close_sess(sess, state);
 	return 0;
 }
 
@@ -465,7 +461,8 @@ static int handle_route_post(struct client_sess *sess,
 	if (!strcmp(uri, "/echo"))
 		return route_show_echo(sess, state);
 
-	send_error_and_close(404, sess, state);
+	send_http_error(404, sess);
+	close_sess(sess, state);
 	return 0;
 }
 
@@ -481,14 +478,12 @@ static int handle_route(struct client_sess *sess, struct server_state *state)
 		ret = handle_route_post(sess, state);
 		break;
 	default:
-		send_error_and_close(405, sess, state);
+		send_http_error(405, sess);
+		close_sess(sess, state);
 		return 0;
 	}
 
-	if (ret)
-		close_sess(sess, state);
-
-	return 0;
+	return ret;
 }
 
 static int _handle_client(struct client_sess *sess, struct server_state *state)
@@ -499,14 +494,20 @@ static int _handle_client(struct client_sess *sess, struct server_state *state)
 	if (!sess->got_http_header) {
 		ret = parse_http_header(sess);
 		if (ret) {
-			send_error_and_close(400, sess, state);
+			send_http_error(400, sess);
 			return 0;
 		}
 		if (!sess->got_http_header)
 			return 0;
 	}
 
-	return handle_route(sess, state);
+	ret = handle_route(sess, state);
+	if (ret) {
+		close_sess(sess, state);
+		if (likely(ret == -EBADMSG || ret == -ENETDOWN))
+			ret = 0;
+	}
+	return ret;
 }
 
 static int handle_client(struct client_sess *sess, struct server_state *state)
