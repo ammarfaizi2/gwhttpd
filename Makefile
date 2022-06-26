@@ -7,3 +7,6 @@ endif
 
 gwhttpd: gwhttpd.cpp
 	$(CXX) $(CXXFLAGS) -o $(@) $(^)
+
+clean:
+	rm -vf gwhttpd
