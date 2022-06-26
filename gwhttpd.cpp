@@ -14,9 +14,11 @@
 #include <cerrno>
 #include <stack>
 #include <queue>
+#include <atomic>
 #include <mutex>
 #include <dirent.h>
 #include <signal.h>
+#include <thread>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -24,15 +26,110 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#define noinline		__attribute__((__noinline__))
+#define __hot			__attribute__((__hot__))
+#define __cold			__attribute__((__cold__))
 #define likely(COND)		__builtin_expect(!!(COND), 1)
 #define unlikely(COND)		__builtin_expect(!!(COND), 0)
-#define NR_EPOLL_EVT		32
-#define NR_MAX_CLIENTS		4096
+#define NR_WORKERS		64
+#define NR_EPOLL_EVT		512
+#define NR_MAX_CLIENTS		999999
 #define IPV4_LEN		(sizeof("xxx.xxx.xxx.xxx"))
 #define FCIP			"%s:%u"
-#define FCIP_ARG(P)		(P)->src_addr, (P)->src_port
+#define FCIP_ARG(P)		((P)->src_addr), ((P)->src_port)
+
+template<typename T>
+struct wq_stack {
+	T	*arr_;
+	size_t	pos_;
+	size_t	max_;
+
+	inline wq_stack(size_t max):
+		pos_(max),
+		max_(max)
+	{
+		arr_ = new T[max];
+	}
+
+	inline ~wq_stack(void)
+	{
+		delete[] arr_;
+	}
+
+	inline int64_t push(T val)
+	{
+		arr_[--pos_] = val;
+		return pos_;
+	}
+
+	inline T top(void)
+	{
+		return arr_[pos_];
+	}
+
+	inline T pop(void)
+	{
+		return arr_[pos_++];
+	}
+
+	inline bool empty(void)
+	{
+		return max_ == pos_;
+	}
+};
+
+
+template<typename T>
+struct wq_queue {
+	T	*arr_;
+	size_t	front_;
+	size_t	rear_;
+	size_t	and_;
+
+	inline wq_queue(size_t want_max):
+		front_(0),
+		rear_(0)
+	{
+		size_t max = 1;
+		while (max < want_max)
+			max *= 2;
+
+		and_ = max - 1;
+		arr_ = new T[max];
+	}
+
+	inline ~wq_queue(void)
+	{
+		delete[] arr_;
+	}
+
+	inline size_t size(void)
+	{
+		if (rear_ >= front_)
+			return rear_ - front_;
+		else
+			return front_ - rear_;
+	}
+
+	inline int64_t push(T val)
+	{
+		arr_[rear_ & and_] = val;
+		return rear_++;
+	}
+
+	inline T front(void)
+	{
+		return arr_[front_ & and_];
+	}
+
+	inline T pop(void)
+	{
+		return arr_[front_++ & and_];
+	}
+};
 
 enum http_method {
+	HTTP_NOP = 0,
 	HTTP_GET,
 	HTTP_POST,
 	HTTP_PATCH,
@@ -40,45 +137,77 @@ enum http_method {
 	HTTP_DELETE,
 };
 
+enum http_action {
+	HTTP_ACT_NONE = 0,
+	HTTP_ACT_DIRLIST,
+	HTTP_ACT_FILE_STREAM,
+};
+
+struct dir_list_data {
+	DIR			*dir;
+	char			path[4096];
+};
+
 struct client_sess {
 	int			fd;
-	size_t			buf_size;
-	char			buf[4096];
+	uint32_t		idx;
+	void			*priv_data;
+
+	enum http_action	action;
 	enum http_method	method;
 	char			*uri;
 	char			*qs;
 	char			*http_ver;
 	char			*body;
 	bool			got_http_header;
-	struct sockaddr_in	addr;
-	uint16_t		src_port;
+	bool			in_queue;
+
 	char			src_addr[IPV4_LEN];
+	uint16_t		src_port;
+	char			recv_buf[4096];
+	size_t			rbuf_len;
+} __attribute__((__aligned__(4096)));
+
+struct server_state;
+struct worker {
+	int			epl_fd;
+	struct epoll_event	events[NR_EPOLL_EVT];
 	uint32_t		idx;
-};
+	struct server_state	*state;
+	wq_queue<uint32_t>	*buf_queue;
+	std::thread		thread;
+	volatile bool		need_join;
+} __attribute__((__aligned__(4096)));
 
 struct server_state {
 	volatile bool		stop;
+	std::atomic<uint32_t>	wrk_idx_use;
 	int			tcp_fd;
-	int			epl_fd;
-	struct epoll_event	events[NR_EPOLL_EVT];
-	std::mutex		*sfi_lock;
-	std::stack<uint32_t>	*sess_free_idx;
-	std::mutex		*bq_lock;
-	std::queue<uint32_t>	*buf_queue;
-	struct client_sess	sess[NR_MAX_CLIENTS];
+	int			sig;
 
 	/*
-	 * Signal caught by the interrupt handler.
+	 * Stack of free session indexes.
 	 */
-	int			sig;
+	wq_stack<uint32_t>	*sess_free;
+	std::mutex		*sess_free_lock;
+
+	/*
+	 * Array of client sessions.
+	 */
+	struct client_sess	sess[NR_MAX_CLIENTS];
+	std::atomic<uint32_t>	nr_on_thread;
+
+	struct worker		*workers;
+
+	const char		*bind_addr;
+	uint16_t		bind_port;
 };
 
-static struct server_state *g_state;
+static struct server_state *g_state = NULL;
 
-static void interrupt_handler(int sig)
+static __cold void signal_handler_func(int sig)
 {
-	putchar('\n');
-	printf("Got signal: %d\n", sig);
+	printf("\nGot signal: %d\n", sig);
 	if (!g_state)
 		return;
 
@@ -86,113 +215,222 @@ static void interrupt_handler(int sig)
 	g_state->sig = sig;
 }
 
-static int init_state(struct server_state *state)
+static __cold struct server_state *alloc_state(void)
+{
+	struct server_state *state;
+
+#ifdef USE_ASAN
+	state = new struct server_state;
+	if (!state) {
+		errno = ENOMEM;
+		perror("new()");
+		return NULL;
+	}
+#else /* #ifdef USE_ASAN */
+	state = (struct server_state *)mmap(NULL, sizeof(*state),
+					    PROT_READ|PROT_WRITE,
+					    MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+	if (state == MAP_FAILED) {
+		perror("mmap");
+		return NULL;
+	}
+	mlock(state, sizeof(*state));
+#endif /* #ifdef USE_ASAN */
+
+	return state;
+}
+
+static __cold void free_state(struct server_state *state)
+{
+#ifdef USE_ASAN
+	delete state;
+#else
+	munlock(state, sizeof(*state));
+	munmap(state, sizeof(*state));
+#endif
+}
+
+static __cold int setup_signal_handler(void)
 {
 	struct sigaction act;
+	int ret;
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = signal_handler_func;
+	ret = sigaction(SIGINT, &act, NULL);
+	if (unlikely(ret))
+		goto err;
+	ret = sigaction(SIGHUP, &act, NULL);
+	if (unlikely(ret))
+		goto err;
+	ret = sigaction(SIGTERM, &act, NULL);
+	if (unlikely(ret))
+		goto err;
+
+	act.sa_handler = SIG_IGN;
+	ret = sigaction(SIGPIPE, &act, NULL);
+	if (unlikely(ret))
+		goto err;
+
+	return 0;
+err:
+	perror("sigaction");
+	return -errno;
+}
+
+static __cold int init_state(struct server_state **state_p)
+{
+	struct server_state *state;
 	uint32_t i;
 	int ret;
 
-	memset(state, 0, sizeof(*state));
-	state->tcp_fd = -1;
-	state->epl_fd = -1;
-	state->sig = -1;
-
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = interrupt_handler;
-	ret = sigaction(SIGINT, &act, NULL);
-	ret |= sigaction(SIGHUP, &act, NULL);
-	ret |= sigaction(SIGTERM, &act, NULL);
-	act.sa_handler = SIG_IGN;
-	ret |= sigaction(SIGPIPE, &act, NULL);
-	if (ret) {
-		fprintf(stderr, "Failed to set up the interrupt handler.\n");
+	ret = setup_signal_handler();
+	if (unlikely(ret))
 		return ret;
-	}
 
-	state->sfi_lock = new std::mutex;
-	if (!state->sfi_lock) {
-		fprintf(stderr, "Cannot allocate sfi_lock\n");
+	state = alloc_state();
+	if (unlikely(!state))
+		return -ENOMEM;
+
+	state->tcp_fd = -1;
+
+	state->sess_free = new wq_stack<uint32_t>(NR_MAX_CLIENTS);
+	if (unlikely(!state->sess_free)) {
+		errno = ENOMEM;
+		perror("state->sess_free = new()");
 		return -ENOMEM;
 	}
 
-	state->bq_lock = new std::mutex;
-	if (!state->sfi_lock) {
-		fprintf(stderr, "Cannot allocate bq_lock\n");
-		goto out_err_bq_lock;
+	state->sess_free_lock = new std::mutex;
+	if (unlikely(!state->sess_free_lock)) {
+		errno = ENOMEM;
+		perror("state->sess_free_lock = new()");
+		goto out_err_sess_free_lock;
 	}
 
-	state->sess_free_idx = new __typeof__(*state->sess_free_idx);
-	if (!state->sess_free_idx) {
-		fprintf(stderr, "Cannot allocate sess_free_idx\n");
-		goto out_err_sess_free_idx;
+	state->workers = new struct worker[NR_WORKERS];
+	if (unlikely(!state->workers)) {
+		ret = -ENOMEM;
+		errno = -ret;
+		perror("state->workers = new()");
+		goto out_err_workers;
 	}
 
-	state->buf_queue = new __typeof__(*state->buf_queue);
-	if (!state->buf_queue) {
-		fprintf(stderr, "Cannot allocate buf_queue\n");
-		goto out_err_buf_queue;
-	}
-
-	for (i = NR_MAX_CLIENTS - 1; i--; ) {
+	i = NR_MAX_CLIENTS;
+	while (i--) {
 		state->sess[i].fd = -1;
 		state->sess[i].idx = i;
-		state->sess_free_idx->push(i);
+		state->sess_free->push(i);
+	}
+
+	i = NR_WORKERS;
+	while (i--)
+		state->workers[i].buf_queue = NULL;
+
+	i = NR_WORKERS;
+	while (i--) {
+		wq_queue<uint32_t> *p = new wq_queue<uint32_t>(NR_MAX_CLIENTS);
+		if (unlikely(!p))
+			goto out_err_wq_queue;
+		state->workers[i].idx = i;
+		state->workers[i].epl_fd = -1;
+		state->workers[i].state = state;
+		state->workers[i].need_join = false;
+		state->workers[i].buf_queue = p;
+	}
+
+	state->stop = false;
+	atomic_store(&state->nr_on_thread, 0);
+	atomic_store(&state->wrk_idx_use, 0);
+	*state_p = state;
+	g_state = state;
+	return 0;
+
+out_err_wq_queue:
+	while (i < NR_WORKERS) {
+		delete state->workers[i].buf_queue;
+		state->workers[i].buf_queue = NULL;
+	}
+out_err_workers:
+	delete state->sess_free_lock;
+	state->sess_free_lock = NULL;
+out_err_sess_free_lock:
+	delete state->sess_free;
+	state->sess_free = NULL;
+	return ret;
+}
+
+static __cold int set_socket_options(int tcp_fd)
+{
+	int val;
+	const void *y = (const void *)&val;
+	const char *on, *ov;
+	int ret;
+
+	val = 1;
+	ret = setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &y, sizeof(val));
+	if (ret < 0) {
+		on = "SOL_SOCKET";
+		ov = "SO_REUSEADDR";
+		goto out_err;
 	}
 
 	return 0;
 
-out_err_buf_queue:
-	delete state->sess_free_idx;
-out_err_sess_free_idx:
-	delete state->bq_lock;
-out_err_bq_lock:
-	delete state->sfi_lock;
-	return -ENOMEM;
+out_err:
+	ret = errno;
+	fprintf(stderr, "setsockopt(%d, %s, %s, ...): %s\n", tcp_fd, on, ov,
+		strerror(ret));
+	return -ret;
 }
 
-static int init_socket(struct server_state *state, const char *addr,
-		       uint16_t port)
+static __cold int init_socket(struct server_state *state)
 {
 	struct sockaddr_in saddr;
 	int tcp_fd;
 	int ret;
-	int y;
+
+	if (unlikely(!state->bind_addr)) {
+		fprintf(stderr, "Error: state->bind_addr is empty!\n");
+		return -EINVAL;
+	}
+
+	if (unlikely(!state->bind_port)) {
+		fprintf(stderr, "Error: state->bind_port is empty!\n");
+		return -EINVAL;
+	}
 
 	tcp_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	if (tcp_fd < 0) {
+	if (unlikely(tcp_fd < 0)) {
 		ret = -errno;
 		perror("socket");
 		return ret;
 	}
 
-	y = 1;
-	ret = setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&y, sizeof(y));
-	if (ret < 0) {
-		ret = -errno;
-		perror("setsockopt");
+	ret = set_socket_options(tcp_fd);
+	if (unlikely(ret))
 		goto out_err;
-	}
 
 	memset(&saddr, 0, sizeof(saddr));
 	saddr.sin_family = AF_INET;
-	saddr.sin_port = htons(port);
-	saddr.sin_addr.s_addr = inet_addr(addr);
+	saddr.sin_addr.s_addr = inet_addr(state->bind_addr);
+	saddr.sin_port = htons(state->bind_port);
 
 	ret = bind(tcp_fd, (struct sockaddr *)&saddr, sizeof(saddr));
-	if (ret < 0) {
+	if (unlikely(ret < 0)) {
 		ret = -errno;
 		perror("bind");
 		goto out_err;
 	}
 
-	ret = listen(tcp_fd, 1000);
-	if (ret < 0) {
+	ret = listen(tcp_fd, 4096);
+	if (unlikely(ret < 0)) {
 		ret = -errno;
 		perror("listen");
-		goto out_err;	
+		goto out_err;
 	}
 
-	printf("Listening on %s:%u...\n", addr, port);
+	printf("Listening on %s:%u...\n", state->bind_addr, state->bind_port);
 	state->tcp_fd = tcp_fd;
 	return 0;
 
@@ -201,131 +439,143 @@ out_err:
 	return ret;
 }
 
-static int init_epoll(struct server_state *state)
+static __cold void wait_for_ready_state(struct worker *worker)
+{
+	uint32_t i = 0;
+	uint32_t on;
+
+	while (true) {
+		on = atomic_load(&worker->state->nr_on_thread);
+		if (on >= NR_WORKERS || worker->state->stop)
+			break;
+
+		usleep(1000);
+		if (i++ < 10000)
+			continue;
+
+		fprintf(stderr, "Timedout while waiting for ready state");
+		worker->state->stop = true;
+		return;
+	}
+}
+
+static int install_infd_to_worker(int fd, struct worker *worker,
+				  epoll_data_t data)
 {
 	struct epoll_event evt;
-	int epl_fd;
 	int ret;
-
-	epl_fd = epoll_create(255);
-	if (epl_fd < 0) {
-		ret = -errno;
-		perror("epoll_create");
-		return ret;
-	}
 
 	memset(&evt, 0, sizeof(evt));
 	evt.events = EPOLLIN | EPOLLPRI;
-	ret = epoll_ctl(epl_fd, EPOLL_CTL_ADD, state->tcp_fd, &evt);
+	evt.data = data;
+	ret = epoll_ctl(worker->epl_fd, EPOLL_CTL_ADD, fd, &evt);
 	if (ret < 0) {
 		ret = -errno;
 		perror("epoll_ctl");
 		return ret;
 	}
-
-	state->epl_fd = epl_fd;
-	return 0;
-}
-
-static void put_sess_idx(uint32_t idx, struct server_state *state)
-{
-	state->sfi_lock->lock();
-	state->sess_free_idx->push(idx);
-	state->sfi_lock->unlock();
+	return ret;
 }
 
 static int64_t get_sess_idx(struct server_state *state)
 {
-	int64_t ret;
-	state->sfi_lock->lock();
-	if (unlikely(state->sess_free_idx->empty())) {
-		state->sfi_lock->unlock();
+	int64_t idx;
+
+	state->sess_free_lock->lock();
+	if (unlikely(state->sess_free->empty())) {
+		state->sess_free_lock->unlock();
 		return -EAGAIN;
 	}
-	ret = state->sess_free_idx->top();
-	state->sess_free_idx->pop();
-	state->sfi_lock->unlock();
+	idx = (int64_t)state->sess_free->pop();
+	state->sess_free_lock->unlock();
+	return idx;
+}
+
+static void put_sess_idx(uint32_t idx, struct server_state *state)
+{
+	state->sess_free_lock->lock();
+	state->sess_free->push(idx);
+	state->sess_free_lock->unlock();
+}
+
+static int uninstall_fd_from_worker(int fd, struct worker *worker)
+{
+	int ret;
+
+	ret = epoll_ctl(worker->epl_fd, EPOLL_CTL_DEL, fd, NULL);
+	if (ret < 0) {
+		ret = -errno;
+		perror("epoll_ctl");
+		return ret;
+	}
 	return ret;
 }
 
-static int delete_client(int epl_fd, struct client_sess *sess)
+static void close_sess(struct client_sess *sess, struct worker *worker)
 {
-	int ret;
-
-	ret = epoll_ctl(epl_fd, EPOLL_CTL_DEL, sess->fd, NULL);
-	if (ret < 0) {
-		ret = -errno;
-		perror("epoll_ctl");
-		return ret;
-	}
-	return 0;
+	printf("Closing session " FCIP " (idx = %u)\n", FCIP_ARG(sess),
+		sess->idx);
+	uninstall_fd_from_worker(sess->fd, worker);
+	close(sess->fd);
+	sess->fd = -1;
+	sess->action = HTTP_ACT_NONE;
+	put_sess_idx(sess->idx, worker->state);
 }
 
-static int register_new_client(int epl_fd, struct client_sess *sess)
+static int _handle_new_client(int tcp_fd, struct worker *worker)
 {
-	struct epoll_event evt;
-	int ret;
-
-	memset(&evt, 0, sizeof(evt));
-	evt.events = EPOLLIN | EPOLLPRI;
-	evt.data.ptr = (void *)sess;
-	ret = epoll_ctl(epl_fd, EPOLL_CTL_ADD, sess->fd, &evt);
-	if (ret < 0) {
-		ret = -errno;
-		perror("epoll_ctl");
-		return ret;
-	}
-	return 0;
-}
-
-static int handle_new_client(struct server_state *state)
-{	
+	struct server_state *state = worker->state;
 	struct sockaddr_in caddr;
 	socklen_t addrlen = sizeof(caddr);
 	struct client_sess *sess;
+	epoll_data_t epld;
+	uint32_t wrk_idx;
 	int64_t idx;
 	int cli_fd;
 	int ret;
 
 	memset(&caddr, 0, sizeof(caddr));
-	cli_fd = accept(state->tcp_fd, (struct sockaddr *)&caddr, &addrlen);
+	cli_fd = accept(tcp_fd, (struct sockaddr *)&caddr, &addrlen);
 	if (unlikely(cli_fd < 0)) {
 		ret = errno;
-		perror("accept");
-		if (ret == EAGAIN || ret == EMFILE)
-			return 0;
+		if (ret != EAGAIN)
+			perror("accept");
 		return -ret;
 	}
 
 	idx = get_sess_idx(state);
 	if (unlikely(idx == -EAGAIN)) {
 		close(cli_fd);
-		fprintf(stderr, "Cannot handle a new client\n");
-		return 0;
+		fprintf(stderr, "Client session is full, cannot handle a new "
+			"client\n");
+		return -EAGAIN;
 	}
 
 	sess = &state->sess[idx];
 	sess->fd = cli_fd;
-	sess->buf_size = 0;
+	sess->rbuf_len = 0;
 	sess->got_http_header = false;
-	sess->addr = caddr;
+	sess->action = HTTP_ACT_NONE;
+	sess->method = HTTP_NOP;
+	sess->in_queue = false;
 
-	sess->src_addr[0] = '\0';
-	sess->src_port = 0;
 	if (addrlen <= sizeof(caddr)) {
 		const char *p;
-		sess->src_port = ntohs(caddr.sin_port);
 		p = inet_ntop(AF_INET, &caddr.sin_addr.s_addr, sess->src_addr,
 			      sizeof(sess->src_addr));
-		if (!p) {
+		if (p)
+			sess->src_port = ntohs(caddr.sin_port);
+		else
 			perror("inet_ntop");
-			fprintf(stderr, "inet_ntop() error?\n");
-		}
 	} else {
+		sess->src_addr[0] = '\0';
+		sess->src_port = 0;
 		fprintf(stderr, "Warning, accept overflow!\n");
 	}
 
-	ret = register_new_client(state->epl_fd, sess);
+	epld.ptr = (void *)sess;
+	wrk_idx = atomic_fetch_add(&state->wrk_idx_use, 1) % NR_WORKERS;
+	ret = install_infd_to_worker(cli_fd, &state->workers[wrk_idx], epld);
 	if (unlikely(ret < 0))
 		return ret;
 
@@ -334,18 +584,38 @@ static int handle_new_client(struct server_state *state)
 	return 0;
 }
 
-static ssize_t send_to_client(struct client_sess *sess, const char *buf,
-			      size_t len)
+static __hot int handle_new_client(struct worker *worker)
+{
+	int tcp_fd = worker->state->tcp_fd;
+	uint32_t acc_iter = 32;
+	int ret;
+
+	while (acc_iter--) {
+		ret = _handle_new_client(tcp_fd, worker);
+		if (likely(!ret))
+			continue;
+
+		if (likely(ret == -EAGAIN) || unlikely(ret == -EMFILE))
+			return 0;
+
+		return ret;
+	}
+	return 0;
+}
+
+static ssize_t send_to_sess(struct client_sess *sess, const char *buf,
+			    size_t len)
 {
 	constexpr uint32_t max_try = 10;
 	uint32_t try_count = 0;
+	int fd = sess->fd;
 	ssize_t ret;
 	int tmp;
 
 repeat:
 	if (unlikely(try_count++ >= max_try))
 		return -ENETDOWN;
-	ret = send(sess->fd, buf, len, MSG_DONTWAIT);
+	ret = send(fd, buf, len, MSG_DONTWAIT);
 	if (unlikely(ret < 0)) {
 		tmp = errno;
 		if (tmp == EAGAIN)
@@ -362,17 +632,20 @@ repeat:
 	return ret;
 }
 
-static void send_http_error(int code, struct client_sess *sess)
+static ssize_t send_http_error(struct client_sess *sess, int code,
+			       const char *errstr)
 {
 	char buf[128];
 	int tmp;
 
 	tmp = snprintf(buf, sizeof(buf),
-			"HTTP/1.1 %d\r\n"
+			"HTTP/1.1 %d%s%s\r\n"
+			"Connection: closed\r\n\r\n"
 			"Content-Type: text/plain\r\n\r\n"
 			"HTTP Error %d",
-			code, code);
-	send_to_client(sess, buf, (size_t)tmp);
+			code, (errstr ? " " : ""), (errstr ? errstr : ""),
+			code);
+	return send_to_sess(sess, buf, (size_t)tmp);
 }
 
 static char *parse_http_method(char *buf, enum http_method *method_p)
@@ -410,20 +683,21 @@ static char *parse_query_string(char *uri, char *end_uri)
 	while (uri < end_uri) {
 		if (*uri++ != '?')
 			continue;
+		uri[-1] = '\0';
 		if (uri == end_uri)
 			/*
 			 * We got an empty query string:
 			 *  "http://somehwere.com/path?"
 			 */
 			return NULL;
-		return uri;
+		return uri[0] ? uri : NULL;
 	}
 	return NULL;
 }
 
 static int parse_http_header(struct client_sess *sess)
 {
-	char *buf = sess->buf;
+	char *buf = sess->recv_buf;
 	char *end;
 	char *ret;
 
@@ -437,7 +711,7 @@ static int parse_http_header(struct client_sess *sess)
 		 * Don't fail here if still have enough buffer,
 		 * we will wait for the next recv() iteration.
 		 */
-		if (sess->buf_size >= sizeof(sess->buf) - 1)
+		if (sess->rbuf_len >= sizeof(sess->recv_buf) - 1)
 			goto bad_req;
 
 		return 0;
@@ -460,6 +734,8 @@ static int parse_http_header(struct client_sess *sess)
 	 *       ^
 	 *     @ret
 	 */
+	if (unlikely(ret[0] != '/'))
+		goto bad_req;
 	sess->uri = ret;
 	ret = strstr(sess->uri, " ");
 	if (unlikely(!ret))
@@ -484,272 +760,330 @@ static int parse_http_header(struct client_sess *sess)
 	return 0;
 
 bad_req:
-	send_http_error(400, sess);
+	send_http_error(sess, 400, "Bad Request");
 	return -EBADMSG;
 }
 
-static void close_sess(struct client_sess *sess, struct server_state *state)
+static ssize_t http_redirect(struct client_sess *sess, const char *location)
 {
-	printf("Closing session " FCIP " (idx = %u)\n", FCIP_ARG(sess),
-		sess->idx);
-	delete_client(state->epl_fd, sess);
-	close(sess->fd);
-	put_sess_idx(sess->idx, state);
+	size_t need_len;
+	ssize_t ret;
+	char *buf;
+	int len;
+
+	need_len = strlen(location) * 2 + 256;
+	buf = new char[need_len];
+	if (unlikely(!buf))
+		return -ENOMEM;
+
+	len = snprintf(buf, need_len,
+			"HTTP/1.1 302\r\n"
+			"Connection: closed\r\n"
+			"Location: %s\r\n\r\nYou are redirected to %s\n\n",
+			location, location);
+
+	ret = send_to_sess(sess, buf, (size_t)len);
+	delete[] buf;
+	return ret;
 }
 
-static int construct_file_list(char *buf, ssize_t buf_size, const char *path,
-			       const char *file)
+static int sdl_open_dir(const char *path, struct client_sess *sess, DIR **dir_p)
 {
-	char pathname[4352];
-	const char *ftype;
+	DIR *dir;
+	int ret;
+
+	dir = opendir(path);
+	if (unlikely(!dir)) {
+		ret = errno;
+		if (ret == ENOENT)
+			send_http_error(sess, 404, "Not Found");
+		else
+			send_http_error(sess, 403, "Forbidden");
+
+		return -EBADMSG;
+	}
+	*dir_p = dir;
+	return 0;
+}
+
+static int construct_flist(const char *path, const char *file, char *buf,
+			   size_t buf_size)
+{
+	char fpath[4096 + 256];
+	const char *type;
 	struct stat st;
 	int ret;
 
-	if (buf_size < 0)
-		return -EOVERFLOW;
+	snprintf(fpath, sizeof(fpath), "%s/%s", path, file);
 
-	snprintf(pathname, sizeof(pathname), "%s/%s", path, file);
-
-	ret = stat(pathname, &st);
+	ret = stat(fpath, &st);
 	if (unlikely(ret < 0)) {
 		ret = errno;
-		fprintf(stderr, "Cannot open \"%s\": %s\n", pathname,
-			strerror(ret));
+		fprintf(stderr, "Can't stat \"%s\": %s\n", fpath, strerror(ret));
 		return -ret;
 	}
 
 	if (st.st_mode & S_IFDIR)
-		ftype = "Directory";
+		type = "Directory";
 	else if (st.st_mode & S_IFREG)
-		ftype = "Regular File";
+		type = "Regular File";
 	else
 		return -ENOTSUP;
 
-	ret = snprintf(
-		buf,
-		buf_size,
+	return snprintf(buf, buf_size,
 		"\t\t<tr>"
 			"<td><a href=\"%s%s\">%s</a></td>"
 			"<td>%s</td>"
 			"<td>%d%d%d%d</td>"
 		"</tr>\n",
 		file, (st.st_mode & S_IFDIR) ? "/" : "", file,
-		ftype,
+		type,
 		(st.st_mode & 07000) >> 9,
 		(st.st_mode & 00700) >> 6,
 		(st.st_mode & 00070) >> 3,
 		(st.st_mode & 00007)
 	);
-	if (ret > buf_size)
-		return buf_size - 1;
+}
 
-	return ret;
+static int queue_dirlist_action(struct client_sess *sess, struct worker *worker,
+				const char *path, DIR *dir)
+{
+	struct dir_list_data *dld;
+
+	if (unlikely(!sess->priv_data)) {
+		dld = new struct dir_list_data;
+		if (unlikely(!dld)) {
+			fprintf(stderr, "Cannot allcoate dir_list_data!\n");
+			return -ENOMEM;
+		}
+
+		dld->dir = dir;
+		snprintf(dld->path, sizeof(dld->path), "%s", path);
+		sess->priv_data = (void *)dld;
+	}
+
+	sess->action = HTTP_ACT_DIRLIST;
+	sess->in_queue = true;
+	worker->buf_queue->push(sess->idx);
+	return 0;
 }
 
 static int show_directory_listing(const char *path, struct client_sess *sess,
-				  struct server_state *state)
+				  struct worker *worker)
 {
-	char buf[1024 * 1024 * 4] = { };
-	ssize_t buf_size;
-	DIR *dr;
-	char *p;
+	constexpr static const char dl_head[] =
+		"HTTP/1.1 200\r\n"
+		"Content-Type: text/html\r\n"
+		"Connection: closed\r\n\r\n"
+		"<!DOCTYPE html>\n"
+		"<html>\n"
+		"<style type=\"text/css\">"
+			"td {padding: 10px;}"
+			"a {color: blue; text-decoration: none}"
+			"a:hover {text-decoration: underline}"
+		"</style>"
+		"<body>\n"
+		"\t<h1>GNU/Weeb HTTP Server</h1>\n"
+		"\t<table border=\"1\">\n"
+		"\t\t<tr>"
+			"<th>Filename</th>"
+			"<th>Type</th>"
+			"<th>Mode</th>"
+		"</tr>\n";
+
+	constexpr static const char dl_foot[] =
+		"\t</table>\n</body>\n</html>\n";
+
+	struct dir_list_data *dld = NULL;
+	char buf[1024 * 128];
+	char *p = buf;
+	DIR *dir = NULL;
 	int ret;
 
-	dr = opendir(path);
-	if (unlikely(!dr)) {
-		ret = errno;
-		perror("opendir");
-		return -ret;
+	#define BSIZE(P)  ((size_t)((P) - (buf)))
+	#define BREM(P)	  (sizeof(buf) - BSIZE(P))
+
+	if (sess->action == HTTP_ACT_NONE) {
+		ret = sdl_open_dir(path, sess, &dir);
+		if (unlikely(ret))
+			return ret;
+
+		memcpy(p, dl_head, sizeof(dl_head) - 1);
+		p += sizeof(dl_head) - 1;
+
+		ret = construct_flist(path, ".", p, BREM(p));
+		if (likely(ret > 0))
+			p += (size_t)ret;
+
+		ret = construct_flist(path, "..", p, BREM(p));
+		if (likely(ret > 0))
+			p += (size_t)ret;
+	} else {
+		dld = (struct dir_list_data *)sess->priv_data;
+		dir = dld->dir;
+		path = dld->path;
 	}
 
-	buf_size = sizeof(buf);
-	p = buf;
-
-	ret = snprintf(p, buf_size,
-			"HTTP/1.1 200\r\n"
-			"Content-Type: text/html\r\n\r\n"
-			"<!DOCTYPE html>\n"
-			"<html>\n"
-			"<style type=\"text/css\">"
-				"td {padding: 10px;}"
-				"a {color: blue; text-decoration: none}"
-				"a:hover {text-decoration: underline}"
-			"</style>"
-			"<body>\n"
-			"\t<h1>GNU/Weeb HTTP Server</h1>\n"
-			"\t<table border=\"1\">\n"
-			"\t\t<tr>"
-				"<th>Filename</th>"
-				"<th>Type</th>"
-				"<th>Mode</th>"
-			"</tr>\n");
-
-	p += ret;
-	buf_size -= ret;
-
-	ret = construct_file_list(p, buf_size, path, ".");
-	if (ret > 0) {
-		p += ret;
-		buf_size -= ret;
-	}
-
-	ret = construct_file_list(p, buf_size, path, "..");
-	if (ret > 0) {
-		p += ret;
-		buf_size -= ret;
-	}
 
 	while (1) {
 		struct dirent *de;
 		const char *f;
 
-		de = readdir(dr);
-		if (!de)
-			break;
+		if (unlikely(BREM(p) < 8192)) {
 
-		f = de->d_name;
-		if (!strcmp(f, ".") || !strcmp(f, ".."))
-			continue;
+			ret = send_to_sess(sess, buf, BSIZE(p));
+			if (unlikely(ret < 0))
+				goto out_net_down;
 
-		ret = construct_file_list(p, buf_size - 128, path, f);
-		if (ret > 0) {
-			p += ret;
-			buf_size -= ret;
-		}
-	}
-	closedir(dr);
-	ret = snprintf(p, buf_size, "\t</table>\n</body>\n</html>\n");
-	buf_size -= ret;
-	send_to_client(sess, buf, sizeof(buf) - buf_size);
-	close_sess(sess, state);
-	return 0;
-}
+			ret = queue_dirlist_action(sess, worker, path, dir);
+			if (unlikely(ret))
+				goto out_net_down;
 
-static int http_redirect(struct client_sess *sess, const char *location)
-{
-	char buf[4096 + 4096 + 256];
-	int len;
-
-	len = snprintf(buf, sizeof(buf),
-			"HTTP/1.1 302\r\n"
-			"Location: %s\r\n\r\nYou are redirected to %s\n\n",
-			location, location);
-
-	return send_to_client(sess, buf, (size_t)len);
-}
-
-static int __handle_route_get(struct client_sess *sess,
-			      struct server_state *state)
-{
-	char pathname[4096];
-	struct stat st;
-	int ret;
-
-	snprintf(pathname, sizeof(pathname), "./%s", sess->uri);
-
-	ret = stat(pathname, &st);
-	if (unlikely(ret < 0)) {
-		ret = errno;
-		fprintf(stderr, "Cannot open \"%s\": %s\n", pathname,
-			strerror(ret));
-		return -ret;
-	}
-
-	if (st.st_mode & S_IFDIR) {
-
-		if (sess->uri[strlen(sess->uri) - 1] != '/') {
-			char *redirect = pathname;
-
-			snprintf(redirect, sizeof(pathname), "%s/",
-				 sess->uri);
-			http_redirect(sess, redirect);
-			close_sess(sess, state);
 			return 0;
 		}
 
-		/*
-		 * This is a directory! Do a directory listing here...
-		 */
-		return show_directory_listing(pathname, sess, state);
+		de = readdir(dir);
+		if (unlikely(!de))
+			break;
+
+		f = de->d_name;
+		if (unlikely(!strcmp(f, ".") || !strcmp(f, "..")))
+			continue;
+
+		ret = construct_flist(path, f, p, BREM(p));
+		if (likely(ret > 0))
+			p += (size_t)ret;
 	}
 
-	if (st.st_mode & S_IFREG) {
-		/*
-		 * This is a regular file! Send to client...
-		 */
+	if (BREM(p) < sizeof(dl_foot) - 1) {
+
+		ret = send_to_sess(sess, buf, BSIZE(p));
+		if (unlikely(ret < 0))
+			goto out_net_down;
+
+		ret = send_to_sess(sess, dl_foot, sizeof(dl_foot) - 1);
+		if (unlikely(ret < 0))
+			goto out_net_down;
+		p = buf;
+
+	} else {
+		memcpy(p, dl_foot, sizeof(dl_foot) - 1);
+		p += (size_t)(sizeof(dl_foot) - 1);
+		ret = send_to_sess(sess, buf, BSIZE(p));
+		if (unlikely(ret < 0))
+			goto out_net_down;
 	}
 
-	return -ENOTSUP;
+	ret = 1;
+out:
+	if (dir)
+		closedir(dir);
+
+	if (dld) {
+		delete dld;
+		sess->priv_data = NULL;
+	}
+	return 1;
+
+out_net_down:
+	ret = -ENETDOWN;
+	goto out;
+
+
+	#undef BSIZE
+	#undef BREM
 }
 
-static int _handle_route_get(struct client_sess *sess,
-			     struct server_state *state)
+static int handle_route_get(struct client_sess *sess, struct worker *worker)
 {
+	char path[4096 + 128];
+	struct stat st;
 	int ret;
+
+	snprintf(path, sizeof(path), "./%s", sess->uri);
 
 	/*
 	 * Don't allow to step up to the parent directory.
 	 */
-	if (unlikely(strstr(sess->uri, "/..")))
-		return -ENOENT;
+	if (unlikely(strstr(path, "/.."))) {
+		send_http_error(sess, 404, "Not Found");
+		return -EBADMSG;
+	}
 
-	ret = __handle_route_get(sess, state);
-	if (ret)
-		return -ENOENT;
+	ret = stat(path, &st);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		fprintf(stderr, "Can't stat \"%s\": %s\n", path, strerror(ret));
+
+		if (ret == ENOENT)
+			send_http_error(sess, 404, "Not Found");
+		else
+			send_http_error(sess, 403, "Forbidden");
+
+		return -EBADMSG;
+	}
+
+	if (st.st_mode & S_IFDIR) {
+		size_t plen;
+		size_t lloc;
+		char *loc;
+
+		plen = strlen(path);
+		if (path[plen - 1] == '/')
+			return show_directory_listing(path, sess, worker);
+
+		lloc = plen + 16;
+		if (sess->qs)
+			lloc += strlen(sess->qs) + 2;
+
+		loc = new char[lloc];
+		if (unlikely(!loc))
+			return -ENETDOWN;
+
+		if (sess->qs)
+			snprintf(loc, lloc, "%s/?%s", path, sess->qs);
+		else
+			snprintf(loc, lloc, "%s/", path);
+
+		http_redirect(sess, loc);
+		delete[] loc;
+		return -ENETDOWN;
+	}
 
 	return 0;
 }
 
-static int handle_route_get(struct client_sess *sess,
-			    struct server_state *state)
-{
-	int ret;
-
-	ret = _handle_route_get(sess, state);
-	if (!ret)
-		return 0;
-
-	if (ret == -ENOENT) {
-		send_http_error(404, sess);
-		close_sess(sess, state);
-		return 0;
-	}
-
-	return ret;
-}
-
-static int handle_route(struct client_sess *sess, struct server_state *state)
+static int handle_route(struct client_sess *sess, struct worker *worker)
 {
 	int ret;
 
 	switch (sess->method) {
 	case HTTP_GET:
-		ret = handle_route_get(sess, state);
+		ret = handle_route_get(sess, worker);
 		break;
 	case HTTP_POST:
 	case HTTP_DELETE:
 	case HTTP_PATCH:
 	case HTTP_PUT:
 	default:
-		send_http_error(405, sess);
-		close_sess(sess, state);
-		return 0;
+		send_http_error(sess, 405, "Method not allowed");
+		return -EBADMSG;
 	}
 
 	return ret;
 }
 
-static int _handle_client(struct client_sess *sess, struct server_state *state)
+static int _handle_client(struct client_sess *sess, struct worker *worker)
 {
 	int ret = 0;
 
-	sess->buf[sess->buf_size] = '\0';
 	if (!sess->got_http_header) {
+		sess->recv_buf[sess->rbuf_len] = '\0';
 		ret = parse_http_header(sess);
-		if (ret)
+		if (unlikely(ret))
 			goto out;
-		if (!sess->got_http_header)
-			return 0;
+		if (unlikely(!sess->got_http_header))
+			goto out;
 	}
 
 #if 0
@@ -758,68 +1092,100 @@ static int _handle_client(struct client_sess *sess, struct server_state *state)
 	printf("HTTP version: %s\n", sess->http_ver);
 #endif
 
-	ret = handle_route(sess, state);
+	ret = handle_route(sess, worker);
 out:
 	if (ret) {
-		close_sess(sess, state);
-		if (likely(ret == -EBADMSG || ret == -ENETDOWN))
+		close_sess(sess, worker);
+		if (likely(ret == -EBADMSG || ret == -ENETDOWN || ret == 1))
 			ret = 0;
 	}
 	return ret;
 }
 
-static int handle_client(struct client_sess *sess, struct server_state *state)
+static int handle_client(struct client_sess *sess, struct worker *worker)
 {
 	ssize_t recv_ret;
 	size_t len;
 	char *buf;
 	int ret;
 
-	len = sizeof(sess->buf) - sess->buf_size - 1;
-	buf = &sess->buf[sess->buf_size];
+	if (unlikely(sess->in_queue))
+		return 0;
+
+	len = sizeof(sess->recv_buf) - 1 - sess->rbuf_len;
+	buf = &sess->recv_buf[sess->rbuf_len];
 
 	recv_ret = recv(sess->fd, buf, len, 0);
-	if (unlikely(recv_ret < 0)) {
+	if (unlikely(recv_ret <= 0)) {
+
+		if (recv_ret == 0) {
+			close_sess(sess, worker);
+			return 0;
+		}
+
 		ret = errno;
 		if (ret == EAGAIN)
 			return 0;
-		perror("recv");
-		return -ret;
-	}
 
-	if (unlikely(recv_ret == 0 && len != 0)) {
-		close_sess(sess, state);
+		close_sess(sess, worker);
+		perror("recv");
 		return 0;
 	}
-
-	sess->buf_size += (size_t)recv_ret;
-	return _handle_client(sess, state);
+	sess->rbuf_len += (size_t)recv_ret;
+	return _handle_client(sess, worker);
 }
 
-static int handle_event(struct epoll_event *event, struct server_state *state)
+static __hot int handle_event(struct epoll_event *event,
+			      struct worker *worker)
 {
-	int ret = 0;
+	struct client_sess *sess;
 
-	if (event->data.fd == 0) {
-		ret = handle_new_client(state);
-	} else {
-		struct client_sess *sess =
-			(struct client_sess *)event->data.ptr;
+	if (!event->data.ptr)
+		return handle_new_client(worker);
 
-		ret = handle_client(sess, state);
+	sess = (struct client_sess *)event->data.ptr;
+	return handle_client(sess, worker);
+}
+
+static __hot int handle_buf_queue(uint32_t idx, struct worker *worker)
+{
+	struct server_state *state = worker->state;
+	struct client_sess *sess = &state->sess[idx];
+	int ret;
+
+	switch (sess->action) {
+	case HTTP_ACT_NONE:
+		ret = -ENETDOWN;
+		break;
+	case HTTP_ACT_DIRLIST:
+		ret = show_directory_listing(NULL, sess, worker);
+		break;
+	case HTTP_ACT_FILE_STREAM:
+		ret = -ENETDOWN;
+		break;
 	}
 
-	return ret;
+	if (ret)
+		close_sess(sess, worker);
+
+	return 0;
 }
 
-static int _run_server(int epl_fd, struct server_state *state)
+static __hot int run_worker(int epl_fd, struct epoll_event *events,
+			    struct worker *worker)
 {
-	struct epoll_event *events = state->events;
+	int timeout = 1000;
+	size_t qlen;
+	int nr_evt;
 	int ret;
 	int i;
 
-	ret = epoll_wait(epl_fd, events, NR_EPOLL_EVT, 1000);
-	if (unlikely(ret < 0)) {
+	qlen = worker->buf_queue->size();
+	if (qlen)
+		timeout = 0;
+
+	nr_evt = epoll_wait(epl_fd, events, NR_EPOLL_EVT, timeout);
+	if (unlikely(nr_evt < 0)) {
 		ret = errno;
 		perror("epoll_wait");
 		if (ret == EINTR)
@@ -827,108 +1193,198 @@ static int _run_server(int epl_fd, struct server_state *state)
 		return -ret;
 	}
 
-	for (i = 0; i < ret; i++) {
-		ret = handle_event(&events[i], state);
+	for (i = 0; i < nr_evt; i++) {
+		ret = handle_event(&events[i], worker);
 		if (unlikely(ret))
 			return ret;
 	}
 
-	return ret;
+	while (qlen--) {
+		uint32_t idx;
+
+		idx = worker->buf_queue->pop();
+		ret = handle_buf_queue(idx, worker);
+		if (unlikely(ret))
+			return ret;
+	}
+
+	return 0;
 }
 
-static int run_server(struct server_state *state)
+static __hot int _worker_func(struct worker *worker)
 {
-	int epl_fd = state->epl_fd;
+	struct epoll_event *events = worker->events;
+	struct server_state *state = worker->state;
+	int epl_fd = worker->epl_fd;
 	int ret = 0;
 
 	while (likely(!state->stop)) {
-		ret = _run_server(epl_fd, state);
-		if (unlikely(ret))
-			break;
+		ret = run_worker(epl_fd, events, worker);
+		if (likely(!ret))
+			continue;
+
+		state->stop = true;
+		break;
 	}
 
 	return ret;
 }
 
-static void destroy_state(struct server_state *state)
+static noinline int worker_func(struct worker *worker)
 {
+	int ret;
+
+	if (worker->idx > 0)
+		worker->need_join = true;
+
+	atomic_fetch_add(&worker->state->nr_on_thread, 1);
+	wait_for_ready_state(worker);
+	ret = _worker_func(worker);
+	atomic_fetch_sub(&worker->state->nr_on_thread, 1);
+	return ret;
+}
+
+static int init_epoll_for_worker(struct worker *worker)
+{
+	int epl_fd;
+
+	epl_fd = epoll_create(255);
+	if (unlikely(epl_fd < 0)) {
+		int ret = errno;
+		perror("epoll_create");
+		return -ret;
+	}
+
+	worker->epl_fd = epl_fd;
+	return 0;
+}
+
+static __cold int wait_for_worker_online(struct worker *worker)
+{
+	uint32_t i = 0;
+	while (!worker->need_join) {
+		usleep(1000);
+		if (i++ < 10000)
+			continue;
+
+		fprintf(stderr, "Timedout while waiting for thread %u\n",
+			worker->idx);
+		worker->state->stop = true;
+		worker->thread.join();
+		worker->need_join = false;
+		return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+static __cold int run_workers(struct server_state *state)
+{
+	struct worker *workers = state->workers;
+	epoll_data_t edt;
+	int ret = 0;
 	uint32_t i;
 
-	if (state->tcp_fd != -1)
-		close(state->tcp_fd);
-	if (state->epl_fd != -1)
-		close(state->epl_fd);
+	i = NR_WORKERS;
+	while (i--) {
+		ret = init_epoll_for_worker(&workers[i]);
+		if (unlikely(ret))
+			return ret;
+	}
 
-	for (i = 0; i < NR_MAX_CLIENTS; i++) {
-		int fd = state->sess[i].fd;
+
+	i = NR_WORKERS;
+	/*
+	 * Skip i == 0, we will run the worker
+	 * on the main thread.
+	 */
+	while (--i > 0) {
+		workers[i].thread = std::thread(worker_func, &workers[i]);
+		ret = wait_for_worker_online(&workers[i]);
+		if (unlikely(ret))
+			return ret;
+	}
+
+	edt.ptr = NULL;
+	ret = install_infd_to_worker(state->tcp_fd, &workers[0], edt);
+	if (unlikely(ret))
+		return ret;
+
+	return worker_func(&workers[0]);
+}
+
+static __cold void destroy_state(struct server_state *state)
+{
+	uint32_t i;
+	int fd;
+
+	if (!state)
+		return;
+
+	fd = state->tcp_fd;
+	if (fd != -1)
+		close(fd);
+
+	/*
+	 * Do not join @workers[0].thread, it doesn't
+	 * have an LWP!
+	 */
+	for (i = 1; i < NR_WORKERS; i++) {
+		if (state->workers[i].need_join)
+			state->workers[i].thread.join();
+	}
+
+	for (i = 0; i < NR_WORKERS; i++) {
+		fd = state->workers[i].epl_fd;
 		if (fd != -1)
 			close(fd);
 	}
 
-	delete state->buf_queue;
-	delete state->sess_free_idx;
-	delete state->bq_lock;
-	delete state->sfi_lock;
-#ifdef USE_ASAN
-	delete state;
-#else
-	munmap(state, sizeof(*state));
-#endif
-	g_state = NULL;
+	for (i = 0; i < NR_MAX_CLIENTS; i++) {
+		fd = state->sess[i].fd;
+		if (fd != -1)
+			close(fd);
+	}
+
+	i = NR_WORKERS;
+	while (i--) {
+		wq_queue<uint32_t> *p = state->workers[i].buf_queue;
+		if (p)
+			delete p;
+	}
+
+	if (state->workers)
+		delete[] state->workers;
+	if (state->sess_free_lock)
+		delete state->sess_free_lock;
+	if (state->sess_free)
+		delete state->sess_free;
+
+	free_state(state);
 }
 
-/**
- *
- * ./gwhttpd 0.0.0.0 8000
- *
- */
 int main(int argc, char *argv[])
 {
-	struct server_state *state;
+	struct server_state *state = NULL;
 	int ret;
 
 	setvbuf(stdout, NULL, _IOLBF, 4096);
-
 	if (argc != 3) {
 		printf("Usage: %s [bind_address] [bind_port]\n", argv[0]);
 		return 0;
 	}
 
-#ifdef USE_ASAN
-	state = new struct server_state;
-	if (!state) {
-		perror("malloc");
-		return ENOMEM;
-	}
-#else
-	state = (struct server_state *)mmap(NULL, sizeof(*state),
-					    PROT_READ|PROT_WRITE,
-					    MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
-	if (state == MAP_FAILED) {
-		ret = errno;
-		perror("mmap");
+	ret = init_state(&state);
+	if (unlikely(ret))
 		return ret;
-	}
 
-	mlock(state, sizeof(*state));
-#endif
+	state->bind_addr = argv[1];
+	state->bind_port = (uint16_t)atoi(argv[2]);
 
-	g_state = state;
-	ret = init_state(state);
-	if (ret)
-		return ret;
-	ret = init_socket(state, argv[1], (uint16_t)atoi(argv[2]));
-	if (ret)
+	ret = init_socket(state);
+	if (unlikely(ret))
 		goto out;
-	ret = init_epoll(state);
-	if (ret)
-		goto out;
-
-	ret = run_server(state);
-
+	ret = run_workers(state);
 out:
 	destroy_state(state);
-	if (ret < 0)
-		ret = -ret;
 	return ret;
 }
