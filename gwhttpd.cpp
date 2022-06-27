@@ -6,6 +6,8 @@
 #define _GNU_SOURCE
 #endif
 
+#include <poll.h>
+#include <fcntl.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -146,6 +148,12 @@ enum http_action {
 struct dir_list_data {
 	DIR			*dir;
 	char			path[4096];
+};
+
+struct stream_file_data {
+	char			*map;
+	off_t			size;
+	off_t			cur_off;
 };
 
 struct client_sess {
@@ -587,7 +595,7 @@ static int _handle_new_client(int tcp_fd, struct worker *worker)
 static __hot int handle_new_client(struct worker *worker)
 {
 	int tcp_fd = worker->state->tcp_fd;
-	uint32_t acc_iter = 32;
+	uint32_t acc_iter = 512;
 	int ret;
 
 	while (acc_iter--) {
@@ -603,33 +611,57 @@ static __hot int handle_new_client(struct worker *worker)
 	return 0;
 }
 
+static int poll_wait_for_fd_be_writable(int fd)
+{
+	struct pollfd fds[0];
+	int ret;
+
+	fds[0].fd = fd;
+	fds[0].events = POLLOUT;
+	fds[0].revents = 0;
+
+	ret = poll(fds, 1, -1);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		if (ret != EINTR)
+			return -ret;
+	}
+	return 0;
+}
+
 static ssize_t send_to_sess(struct client_sess *sess, const char *buf,
 			    size_t len)
 {
-	constexpr uint32_t max_try = 10;
-	uint32_t try_count = 0;
+	const char *bptr = buf;
+	ssize_t total_sent = 0;
+	size_t blen = len;
 	int fd = sess->fd;
-	ssize_t ret;
-	int tmp;
+	ssize_t ret;	
 
 repeat:
-	if (unlikely(try_count++ >= max_try))
-		return -ENETDOWN;
-	ret = send(fd, buf, len, MSG_DONTWAIT);
+	ret = send(fd, bptr, blen, MSG_DONTWAIT);
 	if (unlikely(ret < 0)) {
-		tmp = errno;
-		if (tmp == EAGAIN)
-			goto repeat;
-		perror("send");
-		return -tmp;
-	} else if (unlikely(ret == 0)) {
-		return -ENETDOWN;
-	} else if (unlikely((size_t)ret < len)) {
-		buf = &buf[len];
-		len -= (size_t)ret;
+		int ret = errno;
+		if (unlikely(ret != EAGAIN)) {
+			perror("send");
+			return -ret;
+		}
+
+		ret = poll_wait_for_fd_be_writable(fd);
+		if (unlikely(ret))
+			return ret;
+
 		goto repeat;
 	}
-	return ret;
+
+	total_sent += ret;
+	if (unlikely((size_t)total_sent < len)) {
+		bptr = &buf[total_sent];
+		blen = len - (size_t)total_sent;
+		goto repeat;
+	}
+
+	return total_sent;
 }
 
 static ssize_t send_http_error(struct client_sess *sess, int code,
@@ -640,7 +672,7 @@ static ssize_t send_http_error(struct client_sess *sess, int code,
 
 	tmp = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 %d%s%s\r\n"
-			"Connection: closed\r\n\r\n"
+			"Connection: closed\r\n"
 			"Content-Type: text/plain\r\n\r\n"
 			"HTTP Error %d",
 			code, (errstr ? " " : ""), (errstr ? errstr : ""),
@@ -823,10 +855,20 @@ static int construct_flist(const char *path, const char *file, char *buf,
 		return -ret;
 	}
 
-	if (st.st_mode & S_IFDIR)
+	if (S_ISDIR(st.st_mode))
 		type = "Directory";
-	else if (st.st_mode & S_IFREG)
+	else if (S_ISREG(st.st_mode))
 		type = "Regular File";
+	else if (S_ISCHR(st.st_mode))
+		type = "Char dev";
+	else if (S_ISBLK(st.st_mode))
+		type = "Block dev";
+	else if (S_ISFIFO(st.st_mode))
+		type = "FIFO";
+	else if (S_ISLNK(st.st_mode))
+		type = "Symlink";
+	else if (S_ISSOCK(st.st_mode))
+		type = "Socket";
 	else
 		return -ENOTSUP;
 
@@ -836,7 +878,7 @@ static int construct_flist(const char *path, const char *file, char *buf,
 			"<td>%s</td>"
 			"<td>%d%d%d%d</td>"
 		"</tr>\n",
-		file, (st.st_mode & S_IFDIR) ? "/" : "", file,
+		file, S_ISDIR(st.st_mode) ? "/" : "", file,
 		type,
 		(st.st_mode & 07000) >> 9,
 		(st.st_mode & 00700) >> 6,
@@ -994,12 +1036,173 @@ out_net_down:
 	#undef BREM
 }
 
+static void not_found_or_forbidden(int e, struct client_sess *sess)
+{
+	if (e == ENOENT)
+		send_http_error(sess, 404, "Not Found");
+	else
+		send_http_error(sess, 403, "Forbidden");
+}
+
+constexpr size_t max_send_len_file = 1024 * 1024;
+
+static int start_stream_file(const char *file, struct client_sess *sess,
+			     struct worker *worker, char **map_p,
+			     size_t *map_size_p)
+{
+	struct stream_file_data *sfd;
+	size_t send_len;
+	size_t map_size;
+	struct stat st;
+	char buf[1024];
+	char *map;
+	int ret;
+	int fd;
+
+	fd = open(file, O_RDONLY);
+	if (unlikely(fd < 0)) {
+		fd = errno;
+		not_found_or_forbidden(fd, sess);
+		fprintf(stderr, "Cannot open file: \"%s\": %s\n", file,
+			strerror(fd));
+		return -EBADMSG;
+	}
+
+	ret = fstat(fd, &st);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		not_found_or_forbidden(ret, sess);
+		close(fd);
+		fprintf(stderr, "Cannot stat file: \"%s\": %s\n", file,
+			strerror(ret));
+		return -EBADMSG;
+	}
+
+	map = (char *)mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (unlikely(map == MAP_FAILED)) {
+		ret = errno;
+		not_found_or_forbidden(ret, sess);
+		close(fd);
+		fprintf(stderr, "Cannot map file: \"%s\": %s\n", file,
+			strerror(ret));
+		return -EBADMSG;
+	}
+	map_size = st.st_size;
+	close(fd);
+
+	ret = snprintf(buf, sizeof(buf),
+			"HTTP/1.1 200 OK\r\n"
+			"Content-Type: text/plain\r\n"
+			"Content-Length: %zu\r\n\r\n",
+			st.st_size);
+
+	ret = send_to_sess(sess, buf, (size_t)ret);
+	if (unlikely(ret < 0)) {
+		munmap(map, map_size);
+		return -EBADMSG;
+	}
+
+	if (map_size > max_send_len_file) {
+		sfd = new struct stream_file_data;
+		if (unlikely(!sfd)) {
+			send_http_error(sess, 503, "");
+			munmap(map, map_size);
+			return -EBADMSG;
+		}
+		sfd->map = map;
+		sfd->size = map_size;
+		sfd->cur_off = max_send_len_file;
+		sess->priv_data = (void *)sfd;
+		sess->action = HTTP_ACT_FILE_STREAM;
+
+		sess->in_queue = true;
+		worker->buf_queue->push(sess->idx);
+
+		madvise(map, map_size, MADV_SEQUENTIAL);
+		send_len = max_send_len_file;
+	} else {
+		send_len = map_size;
+	}
+
+	ret = send_to_sess(sess, map, send_len);
+	if (unlikely(ret < 0)) {
+		if (sfd) {
+			delete sfd;
+			sess->priv_data = NULL;
+		}
+		munmap(map, map_size);
+		return -EBADMSG;
+	}
+	*map_p = map;
+	*map_size_p = map_size;
+	return 0;
+}
+
+static int stream_file(const char *file, struct client_sess *sess,
+		       struct worker *worker)
+{
+	struct stream_file_data *sfd = NULL;
+	size_t map_size;
+	char *map;
+	int ret;
+
+	if (sess->action == HTTP_ACT_NONE) {
+		ret = start_stream_file(file, sess, worker, &map, &map_size);
+		if (unlikely(ret))
+			return ret;
+		if (sess->action == HTTP_ACT_FILE_STREAM)
+			return 0;
+	} else {
+		size_t remaining_len;
+		size_t send_len;
+		char *ptr;
+
+		sfd = (struct stream_file_data *)sess->priv_data;
+		map = sfd->map;
+		ptr = &map[sfd->cur_off];
+		map_size = sfd->size;
+		remaining_len = sfd->size - sfd->cur_off;
+
+		if (remaining_len > max_send_len_file)
+			send_len = max_send_len_file;
+		else
+			send_len = remaining_len;
+
+		ret = send_to_sess(sess, ptr, send_len);
+		if (unlikely(ret < 0)) {
+			if (sfd) {
+				delete sfd;
+				sess->priv_data = NULL;
+			}
+			munmap(map, map_size);
+			return -EBADMSG;
+		}
+		sfd->cur_off += (off_t)ret;
+		remaining_len = sfd->size - sfd->cur_off;
+
+		if (remaining_len > 0) {
+			sess->in_queue = true;
+			sess->action = HTTP_ACT_FILE_STREAM;
+			worker->buf_queue->push(sess->idx);
+			return 0;
+		}
+	}
+
+	if (sfd) {
+		delete sfd;
+		sess->priv_data = NULL;
+	}
+	munmap(map, map_size);
+	return 1;
+}
+
 static int handle_route_get(struct client_sess *sess, struct worker *worker)
 {
 	char path[4096 + 128];
 	struct stat st;
 	int ret;
 
+	sess->in_queue = true;
 	snprintf(path, sizeof(path), "./%s", sess->uri);
 
 	/*
@@ -1023,7 +1226,7 @@ static int handle_route_get(struct client_sess *sess, struct worker *worker)
 		return -EBADMSG;
 	}
 
-	if (st.st_mode & S_IFDIR) {
+	if (S_ISDIR(st.st_mode)) {
 		size_t plen;
 		size_t lloc;
 		char *loc;
@@ -1049,6 +1252,9 @@ static int handle_route_get(struct client_sess *sess, struct worker *worker)
 		delete[] loc;
 		return -ENETDOWN;
 	}
+
+	if (S_ISREG(st.st_mode))
+		return stream_file(path, sess, worker);
 
 	return 0;
 }
@@ -1095,7 +1301,8 @@ static int _handle_client(struct client_sess *sess, struct worker *worker)
 	ret = handle_route(sess, worker);
 out:
 	if (ret) {
-		close_sess(sess, worker);
+		if (sess->in_queue)
+			close_sess(sess, worker);
 		if (likely(ret == -EBADMSG || ret == -ENETDOWN || ret == 1))
 			ret = 0;
 	}
@@ -1161,7 +1368,7 @@ static __hot int handle_buf_queue(uint32_t idx, struct worker *worker)
 		ret = show_directory_listing(NULL, sess, worker);
 		break;
 	case HTTP_ACT_FILE_STREAM:
-		ret = -ENETDOWN;
+		ret = stream_file(NULL, sess, worker);
 		break;
 	}
 
