@@ -1193,8 +1193,6 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		sess->action = HTTP_ACT_FILE_STREAM;
 
 		sess->in_queue = true;
-		worker->buf_queue->push(sess->idx);
-
 		madvise(map, map_size, MADV_SEQUENTIAL);
 	} else {
 		send_len = map_size - offset_file;
@@ -1211,6 +1209,9 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		}
 		munmap(map, map_size);
 		return -EBADMSG;
+	} else {
+		if (sess->in_queue)
+			worker->buf_queue->push(sess->idx);
 	}
 	*map_p = map;
 	*map_size_p = map_size;
