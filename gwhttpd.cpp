@@ -1154,7 +1154,7 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 	ret = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 200 OK\r\n"
 			"Content-Type: text/plain\r\n"
-			"Content-Range: bytes: %lu-%lu/%lu\r\n"
+			"Content-Range: bytes %lu-%lu/%lu\r\n"
 			"Content-Length: %zu\r\n\r\n",
 			offset_file, map_size, map_size,
 			st.st_size);
