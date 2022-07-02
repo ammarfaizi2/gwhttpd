@@ -1095,6 +1095,7 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 {
 	struct stream_file_data *sfd = NULL;
 	off_t offset_file = 0;
+	const char *http_code;
 	size_t send_len;
 	size_t map_size;
 	struct stat st;
@@ -1151,11 +1152,17 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		}
 	}
 
+	if (offset_file > 0)
+		http_code = "206 Partial Content";
+	else
+		http_code = "200 OK";
+
 	ret = snprintf(buf, sizeof(buf),
-			"HTTP/1.1 200 OK\r\n"
+			"HTTP/1.1 %s\r\n"
 			"Content-Type: text/plain\r\n"
 			"Content-Range: bytes %lu-%lu/%lu\r\n"
 			"Content-Length: %zu\r\n\r\n",
+			http_code,
 			offset_file, map_size, map_size,
 			st.st_size);
 
