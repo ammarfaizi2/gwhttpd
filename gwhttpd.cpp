@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <signal.h>
 #include <thread>
+#include <unordered_map>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -166,14 +167,15 @@ struct client_sess {
 	char			*uri;
 	char			*qs;
 	char			*http_ver;
+	char			*header;
 	char			*body;
 	bool			got_http_header;
 	bool			in_queue;
-
 	char			src_addr[IPV4_LEN];
 	uint16_t		src_port;
 	char			recv_buf[4096];
 	size_t			rbuf_len;
+	std::unordered_map<std::string, std::string>	*http_headers;
 } __attribute__((__aligned__(4096)));
 
 struct server_state;
@@ -527,6 +529,8 @@ static void close_sess(struct client_sess *sess, struct worker *worker)
 	close(sess->fd);
 	sess->fd = -1;
 	sess->action = HTTP_ACT_NONE;
+	delete sess->http_headers;
+	sess->http_headers = NULL;
 	put_sess_idx(sess->idx, worker->state);
 }
 
@@ -613,7 +617,7 @@ static __hot int handle_new_client(struct worker *worker)
 
 static int poll_wait_for_fd_be_writable(int fd)
 {
-	struct pollfd fds[0];
+	struct pollfd fds[1];
 	int ret;
 
 	fds[0].fd = fd;
@@ -788,6 +792,7 @@ static int parse_http_header(struct client_sess *sess)
 		goto bad_req;
 
 	ret[0] = '\0';
+	sess->header = &ret[1];
 	sess->got_http_header = true;
 	return 0;
 
@@ -1044,13 +1049,52 @@ static void not_found_or_forbidden(int e, struct client_sess *sess)
 		send_http_error(sess, 403, "Forbidden");
 }
 
+static int parse_http_header2(struct client_sess *sess)
+{
+	char *hdr = sess->header + 1;
+
+	if (!sess->http_headers)
+		sess->http_headers = new __typeof__(*sess->http_headers);
+
+	while (1) {
+		char *keyval, *key, *val, *it;
+
+		key = hdr;
+		keyval = strstr(key, "\r\n");
+		if (!keyval)
+			break;
+		keyval[0] = '\0';
+
+		hdr = &keyval[2];
+		val = strstr(key, ":");
+		if (!val)
+			continue;
+		val[0] = '\0';
+		val++;
+
+		while (*val == ' ')
+			val++;
+
+		it = key;
+		while (*it) {
+			*it = tolower((unsigned char)*it);
+			it++;
+		}
+
+		sess->http_headers->emplace(key, val);
+	}
+
+	return 0;
+}
+
 constexpr size_t max_send_len_file = 1024 * 1024;
 
 static int start_stream_file(const char *file, struct client_sess *sess,
 			     struct worker *worker, char **map_p,
 			     size_t *map_size_p)
 {
-	struct stream_file_data *sfd;
+	struct stream_file_data *sfd = NULL;
+	off_t offset_file = 0;
 	size_t send_len;
 	size_t map_size;
 	struct stat st;
@@ -1078,6 +1122,8 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		return -EBADMSG;
 	}
 
+	parse_http_header2(sess);
+
 	map = (char *)mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 	if (unlikely(map == MAP_FAILED)) {
 		ret = errno;
@@ -1090,10 +1136,27 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 	map_size = st.st_size;
 	close(fd);
 
+	{
+		const auto &http_headers = *sess->http_headers;
+		auto it = http_headers.find("range");
+		if (it != http_headers.end()) {
+			const char *val = it->second.c_str();
+			const char *start_bytes;
+
+			start_bytes = strstr(val, "bytes=");
+			if (start_bytes) {
+				start_bytes += 6;
+				offset_file = strtoull(start_bytes, NULL, 10);
+			}
+		}
+	}
+
 	ret = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 200 OK\r\n"
 			"Content-Type: text/plain\r\n"
+			"Content-Range: bytes: %lu-%lu/%lu\r\n"
 			"Content-Length: %zu\r\n\r\n",
+			offset_file, map_size, map_size,
 			st.st_size);
 
 	ret = send_to_sess(sess, buf, (size_t)ret);
@@ -1111,7 +1174,14 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		}
 		sfd->map = map;
 		sfd->size = map_size;
-		sfd->cur_off = max_send_len_file;
+		sfd->cur_off = offset_file + max_send_len_file;
+		if (sfd->cur_off >= sfd->size) {
+			sfd->cur_off = sfd->size - 1;
+			send_len = sfd->size - offset_file + 1;
+		} else {
+			send_len = max_send_len_file;
+		}
+
 		sess->priv_data = (void *)sfd;
 		sess->action = HTTP_ACT_FILE_STREAM;
 
@@ -1119,7 +1189,8 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		worker->buf_queue->push(sess->idx);
 
 		madvise(map, map_size, MADV_SEQUENTIAL);
-		send_len = max_send_len_file;
+		if (offset_file > 0)
+			map = &map[offset_file];
 	} else {
 		send_len = map_size;
 	}
@@ -1202,7 +1273,6 @@ static int handle_route_get(struct client_sess *sess, struct worker *worker)
 	struct stat st;
 	int ret;
 
-	sess->in_queue = true;
 	snprintf(path, sizeof(path), "./%s", sess->uri);
 
 	/*
@@ -1301,7 +1371,7 @@ static int _handle_client(struct client_sess *sess, struct worker *worker)
 	ret = handle_route(sess, worker);
 out:
 	if (ret) {
-		if (sess->in_queue)
+		if (!sess->in_queue)
 			close_sess(sess, worker);
 		if (likely(ret == -EBADMSG || ret == -ENETDOWN || ret == 1))
 			ret = 0;
@@ -1358,7 +1428,7 @@ static __hot int handle_buf_queue(uint32_t idx, struct worker *worker)
 {
 	struct server_state *state = worker->state;
 	struct client_sess *sess = &state->sess[idx];
-	int ret;
+	int ret = 0;
 
 	switch (sess->action) {
 	case HTTP_ACT_NONE:
