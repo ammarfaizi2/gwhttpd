@@ -1197,8 +1197,7 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 
 		madvise(map, map_size, MADV_SEQUENTIAL);
 	} else {
-
-		send_len = map_size;
+		send_len = map_size - offset_file;
 	}
 
 	if (offset_file > 0)
