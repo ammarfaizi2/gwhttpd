@@ -1137,6 +1137,7 @@ static char *open_file_for_stream(const char *file, struct stat *st,
 }
 
 static int send_http_header_for_stream_file(struct client_sess *sess,
+					    off_t start_offset,
 					    off_t content_length)
 {
 	char buf[1024];
@@ -1145,8 +1146,11 @@ static int send_http_header_for_stream_file(struct client_sess *sess,
 	ret = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 %s\r\n"
 			"Content-Type: text/plain\r\n"
+			"Content-Range: bytes %lu-%lu/%lu\r\n"
 			"Content-Length: %zu\r\n\r\n",
-			"200", content_length);
+			start_offset ? "206 Partial Content" : "200 OK",
+			start_offset, content_length - 1, content_length,
+			content_length);
 
 	ret = send_to_sess(sess, buf, (size_t)ret);
 	if (unlikely(ret < 0))
@@ -1158,9 +1162,14 @@ static int send_http_header_for_stream_file(struct client_sess *sess,
 static int stream_file_once(struct stream_file_data *sfd,
 			    struct client_sess *sess)
 {
+	size_t send_len;
 	int ret;
 
-	ret = send_to_sess(sess, sfd->map, sfd->size);
+	if (unlikely(sfd->cur_off >= sfd->size))
+		return 1;
+
+	send_len = (size_t)(sfd->size - sfd->cur_off);
+	ret = send_to_sess(sess, &sfd->map[sfd->cur_off], send_len);
 	if (unlikely(ret < 0))
 		return -EBADMSG;
 
@@ -1175,6 +1184,11 @@ static int stream_file_loop(struct stream_file_data *sfd,
 {
 	size_t send_len;
 	int ret;
+
+	if (unlikely(sfd->cur_off >= sfd->size)) {
+		ret = 1;
+		goto out;
+	}
 
 	if (unlikely(!sess->priv_data)) {
 		struct stream_file_data *sfd_h;
@@ -1219,10 +1233,29 @@ out:
 	return ret;
 }
 
+static void handle_range_header(struct client_sess *sess, off_t *start_offset_p)
+{
+	parse_http_header2(sess);
+
+	const auto &http_headers = *sess->http_headers;
+	auto it = http_headers.find("range");
+	if (it != http_headers.end()) {
+		const char *val = it->second.c_str();
+		const char *start_bytes;
+
+		start_bytes = strstr(val, "bytes=");
+		if (start_bytes) {
+			start_bytes += 6;
+			*start_offset_p = strtoull(start_bytes, NULL, 10);
+		}
+	}
+}
+
 static int start_stream_file(const char *file, struct client_sess *sess,
 			     struct worker *worker)
 {
 	struct stream_file_data sfd;
+	off_t start_offset = 0;
 	struct stat st;
 	char *map;
 	int ret;
@@ -1231,7 +1264,10 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 	if (unlikely(!map))
 		return -EBADMSG;
 
-	ret = send_http_header_for_stream_file(sess, st.st_size);
+
+	handle_range_header(sess, &start_offset);
+	sfd.cur_off = start_offset;
+	ret = send_http_header_for_stream_file(sess, start_offset, st.st_size);
 	if (unlikely(ret))
 		return -EBADMSG;
 
@@ -1240,8 +1276,6 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		munmap(sfd.map, sfd.size);
 	} else {
 		ret = stream_file_loop(&sfd, sess, worker);
-		if (unlikely(ret))
-			munmap(sfd.map, sfd.size);
 	}
 
 	return ret;
