@@ -1196,11 +1196,13 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		worker->buf_queue->push(sess->idx);
 
 		madvise(map, map_size, MADV_SEQUENTIAL);
-		if (offset_file > 0)
-			map = &map[offset_file];
 	} else {
+
 		send_len = map_size;
 	}
+
+	if (offset_file > 0)
+		map = &map[offset_file];
 
 	ret = send_to_sess(sess, map, send_len);
 	if (unlikely(ret < 0)) {
