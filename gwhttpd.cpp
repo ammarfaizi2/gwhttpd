@@ -361,6 +361,7 @@ out_err_wq_queue:
 	while (i < NR_WORKERS) {
 		delete state->workers[i].buf_queue;
 		state->workers[i].buf_queue = NULL;
+		i++;
 	}
 out_err_workers:
 	delete state->sess_free_lock;
@@ -534,8 +535,10 @@ static void close_sess(struct client_sess *sess, struct worker *worker)
 	close(sess->fd);
 	sess->fd = -1;
 	sess->action = HTTP_ACT_NONE;
-	delete sess->http_headers;
-	sess->http_headers = NULL;
+	if (sess->http_headers) {
+		delete sess->http_headers;
+		sess->http_headers = NULL;
+	}
 	put_sess_idx(sess->idx, worker->state);
 }
 
