@@ -34,9 +34,9 @@
 #define __cold			__attribute__((__cold__))
 #define likely(COND)		__builtin_expect(!!(COND), 1)
 #define unlikely(COND)		__builtin_expect(!!(COND), 0)
-#define NR_WORKERS		64
-#define NR_EPOLL_EVT		512
-#define NR_MAX_CLIENTS		999999
+#define NR_WORKERS		4
+#define NR_EPOLL_EVT		4
+#define NR_MAX_CLIENTS		100
 #define IPV4_LEN		(sizeof("xxx.xxx.xxx.xxx"))
 #define FCIP			"%s:%u"
 #define FCIP_ARG(P)		((P)->src_addr), ((P)->src_port)
@@ -175,6 +175,7 @@ struct client_sess {
 	uint16_t		src_port;
 	char			recv_buf[4096];
 	size_t			rbuf_len;
+	bool			need_epl_del;
 	std::unordered_map<std::string, std::string>	*http_headers;
 } __attribute__((__aligned__(4096)));
 
@@ -514,6 +515,7 @@ static int uninstall_fd_from_worker(int fd, struct worker *worker)
 
 	ret = epoll_ctl(worker->epl_fd, EPOLL_CTL_DEL, fd, NULL);
 	if (ret < 0) {
+		__asm__ volatile (".byte 0xcc");
 		ret = -errno;
 		perror("epoll_ctl");
 		return ret;
@@ -525,7 +527,10 @@ static void close_sess(struct client_sess *sess, struct worker *worker)
 {
 	printf("Closing session " FCIP " (idx = %u)\n", FCIP_ARG(sess),
 		sess->idx);
-	uninstall_fd_from_worker(sess->fd, worker);
+
+	if (sess->need_epl_del)
+		uninstall_fd_from_worker(sess->fd, worker);
+
 	close(sess->fd);
 	sess->fd = -1;
 	sess->action = HTTP_ACT_NONE;
@@ -591,6 +596,7 @@ static int _handle_new_client(int tcp_fd, struct worker *worker)
 	if (unlikely(ret < 0))
 		return ret;
 
+	sess->need_epl_del = true;
 	printf("Got a new client (idx = %u) " FCIP "\n", sess->idx,
 		FCIP_ARG(sess));
 	return 0;
@@ -1087,19 +1093,10 @@ static int parse_http_header2(struct client_sess *sess)
 	return 0;
 }
 
-constexpr size_t max_send_len_file = 1024 * 1024;
-
-static int start_stream_file(const char *file, struct client_sess *sess,
-			     struct worker *worker, char **map_p,
-			     size_t *map_size_p)
+static char *open_file_for_stream(const char *file, struct stat *st,
+				  struct client_sess *sess,
+				  struct stream_file_data *sfd)
 {
-	struct stream_file_data *sfd = NULL;
-	off_t offset_file = 0;
-	const char *http_code;
-	size_t send_len;
-	size_t map_size;
-	struct stat st;
-	char buf[1024];
 	char *map;
 	int ret;
 	int fd;
@@ -1110,169 +1107,164 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 		not_found_or_forbidden(fd, sess);
 		fprintf(stderr, "Cannot open file: \"%s\": %s\n", file,
 			strerror(fd));
-		return -EBADMSG;
+		return NULL;
 	}
 
-	ret = fstat(fd, &st);
+	ret = fstat(fd, st);
 	if (unlikely(ret < 0)) {
 		ret = errno;
 		not_found_or_forbidden(ret, sess);
 		close(fd);
 		fprintf(stderr, "Cannot stat file: \"%s\": %s\n", file,
 			strerror(ret));
-		return -EBADMSG;
+		return NULL;
 	}
 
-	parse_http_header2(sess);
-
-	map = (char *)mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	map = (char *)mmap(NULL, st->st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
 	if (unlikely(map == MAP_FAILED)) {
 		ret = errno;
 		not_found_or_forbidden(ret, sess);
-		close(fd);
 		fprintf(stderr, "Cannot map file: \"%s\": %s\n", file,
 			strerror(ret));
-		return -EBADMSG;
-	}
-	map_size = st.st_size;
-	close(fd);
-
-	{
-		const auto &http_headers = *sess->http_headers;
-		auto it = http_headers.find("range");
-		if (it != http_headers.end()) {
-			const char *val = it->second.c_str();
-			const char *start_bytes;
-
-			start_bytes = strstr(val, "bytes=");
-			if (start_bytes) {
-				start_bytes += 6;
-				offset_file = strtoull(start_bytes, NULL, 10);
-			}
-		}
+		return NULL;
 	}
 
-	if (offset_file > 0)
-		http_code = "206 Partial Content";
-	else
-		http_code = "200 OK";
+	sfd->size = st->st_size;
+	sfd->map = map;
+	sfd->cur_off = 0;
+	return map;
+}
+
+static int send_http_header_for_stream_file(struct client_sess *sess,
+					    off_t content_length)
+{
+	char buf[1024];
+	int ret;
 
 	ret = snprintf(buf, sizeof(buf),
 			"HTTP/1.1 %s\r\n"
 			"Content-Type: text/plain\r\n"
-			"Content-Range: bytes %lu-%lu/%lu\r\n"
 			"Content-Length: %zu\r\n\r\n",
-			http_code,
-			offset_file, map_size, map_size,
-			st.st_size);
+			"200", content_length);
 
 	ret = send_to_sess(sess, buf, (size_t)ret);
-	if (unlikely(ret < 0)) {
-		munmap(map, map_size);
+	if (unlikely(ret < 0))
 		return -EBADMSG;
-	}
 
-	if (map_size > max_send_len_file) {
-		sfd = new struct stream_file_data;
-		if (unlikely(!sfd)) {
-			send_http_error(sess, 503, "");
-			munmap(map, map_size);
-			return -EBADMSG;
-		}
-		sfd->map = map;
-		sfd->size = map_size;
-		sfd->cur_off = offset_file + max_send_len_file;
-		if (sfd->cur_off >= sfd->size) {
-			sfd->cur_off = sfd->size - 1;
-			send_len = sfd->size - offset_file + 1;
-		} else {
-			send_len = max_send_len_file;
-		}
-
-		sess->priv_data = (void *)sfd;
-		sess->action = HTTP_ACT_FILE_STREAM;
-
-		sess->in_queue = true;
-		madvise(map, map_size, MADV_SEQUENTIAL);
-	} else {
-		send_len = map_size - offset_file;
-	}
-
-	if (offset_file > 0)
-		map = &map[offset_file];
-
-	ret = send_to_sess(sess, map, send_len);
-	if (unlikely(ret < 0)) {
-		if (sfd) {
-			delete sfd;
-			sess->priv_data = NULL;
-		}
-		munmap(map, map_size);
-		return -EBADMSG;
-	} else {
-		if (sess->in_queue)
-			worker->buf_queue->push(sess->idx);
-	}
-	*map_p = map;
-	*map_size_p = map_size;
 	return 0;
+}
+
+static int stream_file_once(struct stream_file_data *sfd,
+			    struct client_sess *sess)
+{
+	int ret;
+
+	ret = send_to_sess(sess, sfd->map, sfd->size);
+	if (unlikely(ret < 0))
+		return -EBADMSG;
+
+	return 1;
+}
+
+constexpr off_t max_send_len_file = 1024 * 128;
+
+static int stream_file_loop(struct stream_file_data *sfd,
+			    struct client_sess *sess,
+			    struct worker *worker)
+{
+	size_t send_len;
+	int ret;
+
+	if (unlikely(!sess->priv_data)) {
+		struct stream_file_data *sfd_h;
+
+		sfd_h = new struct stream_file_data;
+		if (unlikely(!sfd_h))
+			return -ENOMEM;
+
+		*sfd_h = *sfd;
+		sfd = sfd_h;
+		sess->priv_data = (void *)sfd_h;
+		madvise(sfd->map, sfd->size, MADV_SEQUENTIAL);
+		send_len = max_send_len_file;
+	} else {
+		send_len = (size_t)(sfd->size - sfd->cur_off);
+		if (send_len > max_send_len_file)
+			send_len = max_send_len_file;
+	}
+
+	ret = send_to_sess(sess, &sfd->map[sfd->cur_off], send_len);
+	if (unlikely(ret < 0)) {
+		ret = -EBADMSG;
+		goto out;
+	}
+	sfd->cur_off += (off_t)ret;
+	ret = 1;
+
+	if (sfd->cur_off < sfd->size) {
+		sess->in_queue = true;
+		sess->action = HTTP_ACT_FILE_STREAM;
+		worker->buf_queue->push(sess->idx);
+		return 0;
+	}
+
+out:
+	munmap(sfd->map, sfd->size);
+	if (likely(sess->priv_data)) {
+		delete (struct stream_file_data *)sess->priv_data;
+		sess->priv_data = NULL;
+	}
+
+	return ret;
+}
+
+static int start_stream_file(const char *file, struct client_sess *sess,
+			     struct worker *worker)
+{
+	struct stream_file_data sfd;
+	struct stat st;
+	char *map;
+	int ret;
+
+	map = open_file_for_stream(file, &st, sess, &sfd);
+	if (unlikely(!map))
+		return -EBADMSG;
+
+	ret = send_http_header_for_stream_file(sess, st.st_size);
+	if (unlikely(ret))
+		return -EBADMSG;
+
+	if (st.st_size <= max_send_len_file) {
+		ret = stream_file_once(&sfd, sess);
+		munmap(sfd.map, sfd.size);
+	} else {
+		ret = stream_file_loop(&sfd, sess, worker);
+		if (unlikely(ret))
+			munmap(sfd.map, sfd.size);
+	}
+
+	return ret;
 }
 
 static int stream_file(const char *file, struct client_sess *sess,
 		       struct worker *worker)
 {
 	struct stream_file_data *sfd = NULL;
-	size_t map_size;
-	char *map;
 	int ret;
 
+	if (sess->need_epl_del) {
+		sess->need_epl_del = false;
+		uninstall_fd_from_worker(sess->fd, worker);
+	}
+
 	if (sess->action == HTTP_ACT_NONE) {
-		ret = start_stream_file(file, sess, worker, &map, &map_size);
+		ret = start_stream_file(file, sess, worker);
 		if (unlikely(ret))
 			return ret;
 		if (sess->action == HTTP_ACT_FILE_STREAM)
 			return 0;
-	} else {
-		size_t remaining_len;
-		size_t send_len;
-		char *ptr;
-
-		sfd = (struct stream_file_data *)sess->priv_data;
-		map = sfd->map;
-		ptr = &map[sfd->cur_off];
-		map_size = sfd->size;
-		remaining_len = sfd->size - sfd->cur_off;
-
-		if (remaining_len > max_send_len_file)
-			send_len = max_send_len_file;
-		else
-			send_len = remaining_len;
-
-		ret = send_to_sess(sess, ptr, send_len);
-		if (unlikely(ret < 0)) {
-			if (sfd) {
-				delete sfd;
-				sess->priv_data = NULL;
-			}
-			munmap(map, map_size);
-			return -EBADMSG;
-		}
-		sfd->cur_off += (off_t)ret;
-		remaining_len = sfd->size - sfd->cur_off;
-
-		if (remaining_len > 0) {
-			sess->in_queue = true;
-			sess->action = HTTP_ACT_FILE_STREAM;
-			worker->buf_queue->push(sess->idx);
-			return 0;
-		}
 	}
-
-	if (sfd) {
-		delete sfd;
-		sess->priv_data = NULL;
-	}
-	munmap(map, map_size);
 	return 1;
 }
 
@@ -1446,9 +1438,13 @@ static __hot int handle_buf_queue(uint32_t idx, struct worker *worker)
 	case HTTP_ACT_DIRLIST:
 		ret = show_directory_listing(NULL, sess, worker);
 		break;
-	case HTTP_ACT_FILE_STREAM:
-		ret = stream_file(NULL, sess, worker);
+	case HTTP_ACT_FILE_STREAM: {
+		struct stream_file_data *sfd;
+
+		sfd = (struct stream_file_data *)sess->priv_data;
+		ret = stream_file_loop(sfd, sess, worker);
 		break;
+	}
 	}
 
 	if (ret)
