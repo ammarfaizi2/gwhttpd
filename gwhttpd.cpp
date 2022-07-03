@@ -41,6 +41,12 @@
 #define FCIP			"%s:%u"
 #define FCIP_ARG(P)		((P)->src_addr), ((P)->src_port)
 
+#if defined(__x86_64__)
+#define	__page_size_aligned_in_smp	__attribute__((__aligned__(4096)))
+#else
+#define	__page_size_aligned_in_smp
+#endif
+
 template<typename T>
 struct wq_stack {
 	T	*arr_;
@@ -177,7 +183,7 @@ struct client_sess {
 	size_t			rbuf_len;
 	bool			need_epl_del;
 	std::unordered_map<std::string, std::string>	*http_headers;
-} __attribute__((__aligned__(4096)));
+} __page_size_aligned_in_smp;
 
 struct server_state;
 struct worker {
@@ -188,7 +194,7 @@ struct worker {
 	wq_queue<uint32_t>	*buf_queue;
 	std::thread		thread;
 	volatile bool		need_join;
-} __attribute__((__aligned__(4096)));
+} __page_size_aligned_in_smp;
 
 struct server_state {
 	volatile bool		stop;
