@@ -351,8 +351,8 @@ static __cold int init_state(struct server_state **state_p)
 	}
 
 	state->stop = false;
-	atomic_store(&state->nr_on_thread, 0);
-	atomic_store(&state->wrk_idx_use, 0);
+	atomic_store(&state->nr_on_thread, 0u);
+	atomic_store(&state->wrk_idx_use, 0u);
 	*state_p = state;
 	g_state = state;
 	return 0;
@@ -594,7 +594,7 @@ static int _handle_new_client(int tcp_fd, struct worker *worker)
 	}
 
 	epld.ptr = (void *)sess;
-	wrk_idx = atomic_fetch_add(&state->wrk_idx_use, 1) % NR_WORKERS;
+	wrk_idx = atomic_fetch_add(&state->wrk_idx_use, 1u) % NR_WORKERS;
 	ret = install_infd_to_worker(cli_fd, &state->workers[wrk_idx], epld);
 	if (unlikely(ret < 0))
 		return ret;
@@ -1287,7 +1287,6 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 static int stream_file(const char *file, struct client_sess *sess,
 		       struct worker *worker)
 {
-	struct stream_file_data *sfd = NULL;
 	int ret;
 
 	if (sess->need_epl_del) {
@@ -1556,10 +1555,10 @@ static noinline int worker_func(struct worker *worker)
 	if (worker->idx > 0)
 		worker->need_join = true;
 
-	atomic_fetch_add(&worker->state->nr_on_thread, 1);
+	atomic_fetch_add(&worker->state->nr_on_thread, 1u);
 	wait_for_ready_state(worker);
 	ret = _worker_func(worker);
-	atomic_fetch_sub(&worker->state->nr_on_thread, 1);
+	atomic_fetch_sub(&worker->state->nr_on_thread, 1u);
 	return ret;
 }
 
