@@ -6,7 +6,7 @@ ifeq ($(SANITIZE_BUILD),1)
 endif
 
 gwhttpd: gwhttpd.cpp
-	$(CXX) $(CXXFLAGS) -o $(@) $(^)
+	$(CXX) $(CXXFLAGS) -o $(@) $(^) -lpthread
 
 clean:
 	rm -vf gwhttpd
