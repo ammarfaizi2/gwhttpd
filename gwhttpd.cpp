@@ -1530,7 +1530,9 @@ out:
 	if (ret) {
 		if (!sess->in_queue)
 			close_sess(sess, worker);
-		if (likely(ret == -EBADMSG || ret == -ENETDOWN || ret == 1))
+		if (likely(ret == -EBADMSG || ret == -ENETDOWN || 
+			   ret == -ECONNRESET || ret == -EPIPE ||
+			   ret == 1))
 			ret = 0;
 	}
 	return ret;
