@@ -152,7 +152,7 @@ enum http_action {
 	HTTP_ACT_FILE_STREAM,
 };
 
-struct dir_list_data {
+struct stream_dir_list_data {
 	DIR			*dir;
 	char			path[4096];
 };
@@ -838,223 +838,6 @@ static ssize_t http_redirect(struct client_sess *sess, const char *location)
 	return ret;
 }
 
-static int sdl_open_dir(const char *path, struct client_sess *sess, DIR **dir_p)
-{
-	DIR *dir;
-	int ret;
-
-	dir = opendir(path);
-	if (unlikely(!dir)) {
-		ret = errno;
-		if (ret == ENOENT)
-			send_http_error(sess, 404, "Not Found");
-		else
-			send_http_error(sess, 403, "Forbidden");
-
-		return -EBADMSG;
-	}
-	*dir_p = dir;
-	return 0;
-}
-
-static int construct_flist(const char *path, const char *file, char *buf,
-			   size_t buf_size)
-{
-	char fpath[4096 + 256];
-	const char *type;
-	struct stat st;
-	int ret;
-
-	snprintf(fpath, sizeof(fpath), "%s/%s", path, file);
-
-	ret = stat(fpath, &st);
-	if (unlikely(ret < 0)) {
-		ret = errno;
-		fprintf(stderr, "Can't stat \"%s\": %s\n", fpath, strerror(ret));
-		return -ret;
-	}
-
-	if (S_ISDIR(st.st_mode))
-		type = "Directory";
-	else if (S_ISREG(st.st_mode))
-		type = "Regular File";
-	else if (S_ISCHR(st.st_mode))
-		type = "Char dev";
-	else if (S_ISBLK(st.st_mode))
-		type = "Block dev";
-	else if (S_ISFIFO(st.st_mode))
-		type = "FIFO";
-	else if (S_ISLNK(st.st_mode))
-		type = "Symlink";
-	else if (S_ISSOCK(st.st_mode))
-		type = "Socket";
-	else
-		return -ENOTSUP;
-
-	return snprintf(buf, buf_size,
-		"\t\t<tr>"
-			"<td><a href=\"%s%s\">%s</a></td>"
-			"<td>%s</td>"
-			"<td>%d%d%d%d</td>"
-		"</tr>\n",
-		file, S_ISDIR(st.st_mode) ? "/" : "", file,
-		type,
-		(st.st_mode & 07000) >> 9,
-		(st.st_mode & 00700) >> 6,
-		(st.st_mode & 00070) >> 3,
-		(st.st_mode & 00007)
-	);
-}
-
-static int queue_dirlist_action(struct client_sess *sess, struct worker *worker,
-				const char *path, DIR *dir)
-{
-	struct dir_list_data *dld;
-
-	if (unlikely(!sess->priv_data)) {
-		dld = new struct dir_list_data;
-		if (unlikely(!dld)) {
-			fprintf(stderr, "Cannot allcoate dir_list_data!\n");
-			return -ENOMEM;
-		}
-
-		dld->dir = dir;
-		snprintf(dld->path, sizeof(dld->path), "%s", path);
-		sess->priv_data = (void *)dld;
-	}
-
-	sess->action = HTTP_ACT_DIRLIST;
-	sess->in_queue = true;
-	worker->buf_queue->push(sess->idx);
-	return 0;
-}
-
-static int show_directory_listing(const char *path, struct client_sess *sess,
-				  struct worker *worker)
-{
-	constexpr static const char dl_head[] =
-		"HTTP/1.1 200\r\n"
-		"Content-Type: text/html\r\n"
-		"Connection: closed\r\n\r\n"
-		"<!DOCTYPE html>\n"
-		"<html>\n"
-		"<style type=\"text/css\">"
-			"td {padding: 10px;}"
-			"a {color: blue; text-decoration: none}"
-			"a:hover {text-decoration: underline}"
-		"</style>"
-		"<body>\n"
-		"\t<h1>GNU/Weeb HTTP Server</h1>\n"
-		"\t<table border=\"1\">\n"
-		"\t\t<tr>"
-			"<th>Filename</th>"
-			"<th>Type</th>"
-			"<th>Mode</th>"
-		"</tr>\n";
-
-	constexpr static const char dl_foot[] =
-		"\t</table>\n</body>\n</html>\n";
-
-	struct dir_list_data *dld = NULL;
-	char buf[1024 * 128];
-	char *p = buf;
-	DIR *dir = NULL;
-	int ret;
-
-	#define BSIZE(P)  ((size_t)((P) - (buf)))
-	#define BREM(P)	  (sizeof(buf) - BSIZE(P))
-
-	if (sess->action == HTTP_ACT_NONE) {
-		ret = sdl_open_dir(path, sess, &dir);
-		if (unlikely(ret))
-			return ret;
-
-		memcpy(p, dl_head, sizeof(dl_head) - 1);
-		p += sizeof(dl_head) - 1;
-
-		ret = construct_flist(path, ".", p, BREM(p));
-		if (likely(ret > 0))
-			p += (size_t)ret;
-
-		ret = construct_flist(path, "..", p, BREM(p));
-		if (likely(ret > 0))
-			p += (size_t)ret;
-	} else {
-		dld = (struct dir_list_data *)sess->priv_data;
-		dir = dld->dir;
-		path = dld->path;
-	}
-
-
-	while (1) {
-		struct dirent *de;
-		const char *f;
-
-		if (unlikely(BREM(p) < 8192)) {
-
-			ret = send_to_sess(sess, buf, BSIZE(p));
-			if (unlikely(ret < 0))
-				goto out_net_down;
-
-			ret = queue_dirlist_action(sess, worker, path, dir);
-			if (unlikely(ret))
-				goto out_net_down;
-
-			return 0;
-		}
-
-		de = readdir(dir);
-		if (unlikely(!de))
-			break;
-
-		f = de->d_name;
-		if (unlikely(!strcmp(f, ".") || !strcmp(f, "..")))
-			continue;
-
-		ret = construct_flist(path, f, p, BREM(p));
-		if (likely(ret > 0))
-			p += (size_t)ret;
-	}
-
-	if (BREM(p) < sizeof(dl_foot) - 1) {
-
-		ret = send_to_sess(sess, buf, BSIZE(p));
-		if (unlikely(ret < 0))
-			goto out_net_down;
-
-		ret = send_to_sess(sess, dl_foot, sizeof(dl_foot) - 1);
-		if (unlikely(ret < 0))
-			goto out_net_down;
-		p = buf;
-
-	} else {
-		memcpy(p, dl_foot, sizeof(dl_foot) - 1);
-		p += (size_t)(sizeof(dl_foot) - 1);
-		ret = send_to_sess(sess, buf, BSIZE(p));
-		if (unlikely(ret < 0))
-			goto out_net_down;
-	}
-
-	ret = 1;
-out:
-	if (dir)
-		closedir(dir);
-
-	if (dld) {
-		delete dld;
-		sess->priv_data = NULL;
-	}
-	return 1;
-
-out_net_down:
-	ret = -ENETDOWN;
-	goto out;
-
-
-	#undef BSIZE
-	#undef BREM
-}
-
 static void not_found_or_forbidden(int e, struct client_sess *sess)
 {
 	if (e == ENOENT)
@@ -1252,10 +1035,11 @@ static void handle_range_header(struct client_sess *sess, off_t *start_offset_p)
 		const char *start_bytes;
 
 		start_bytes = strstr(val, "bytes=");
-		if (start_bytes) {
-			start_bytes += 6;
-			*start_offset_p = strtoll(start_bytes, NULL, 10);
-		}
+		if (!start_bytes)
+			return;
+
+		start_bytes += 6;
+		*start_offset_p = strtoll(start_bytes, NULL, 10);
 	}
 }
 
@@ -1312,11 +1096,6 @@ static int stream_file(const char *file, struct client_sess *sess,
 {
 	int ret;
 
-	if (sess->need_epl_del) {
-		sess->need_epl_del = false;
-		uninstall_fd_from_worker(sess->fd, worker);
-	}
-
 	if (sess->action == HTTP_ACT_NONE) {
 		ret = start_stream_file(file, sess, worker);
 		if (unlikely(ret))
@@ -1327,11 +1106,353 @@ static int stream_file(const char *file, struct client_sess *sess,
 	return 1;
 }
 
+#if 0
+static size_t htmlspecialchars(char *_output, size_t outlen, const char *_input,
+			       size_t inlen)
+{
+	struct html_char_map {
+		const char	to[8];
+		const uint8_t	len;
+	};
+
+	static const struct html_char_map html_map[0x100u] = {
+		['<'] = {"&lt;",	4},
+		['>'] = {"&gt;",	4},
+		['"'] = {"&quot;",	6},
+		['&'] = {"&amp;",	5},
+	};
+
+
+	size_t j = 0;
+	uint8_t len = 0;
+	unsigned char *output = (unsigned char *)_output;
+	const unsigned char *input  = (const unsigned char *)_input;
+	const unsigned char *in_end = input + inlen;
+
+	while (likely(input < in_end)) {
+		const unsigned char *cp;
+		const struct html_char_map *map_to = &html_map[(size_t)*input];
+
+		if (likely(*map_to->to == '\0')) {
+			cp  = input;
+			len = 1;
+		} else {
+			cp  = (const unsigned char *)map_to->to;
+			len = map_to->len;
+		}
+
+		if (unlikely((j + len - 1) >= outlen))
+			break;
+
+		memcpy(&output[j], cp, len);
+		j += len;
+		input++;
+	}
+
+	if (likely(outlen > 0)) {
+		if (unlikely((j + 1) > outlen))
+			j -= len;
+		output[++j] = '\0';
+	}
+
+	return j;
+}
+#endif
+
+static int redirect_on_no_trailing_slash(const char *path,
+					 struct client_sess *sess)
+{
+	size_t len;
+	char *buf;
+	char *qs;
+
+	len = strlen(path);
+	if (path[len - 1] == '/')
+		return 0;
+
+	qs = sess->qs;
+	if (qs)
+		len += strlen(qs);
+
+	len += 16;
+	buf = new char[len];
+	if (unlikely(!buf))
+		return -ENETDOWN;
+
+	if (qs)
+		snprintf(buf, len, "%s/?%s", path, qs);
+	else
+		snprintf(buf, len, "%s/", path);
+
+	http_redirect(sess, buf);
+	delete[] buf;
+	return 1;
+}
+
+static int stream_dir_list_open(const char *path, struct client_sess *sess,
+				DIR **dir_p)
+{
+	DIR *dir;
+	int ret;
+
+	dir = opendir(path);
+	if (unlikely(!dir)) {
+		ret = errno;
+		if (ret == ENOENT)
+			send_http_error(sess, 404, "Not Found");
+		else
+			send_http_error(sess, 403, "Forbidden");
+
+		return -EBADMSG;
+	}
+	*dir_p = dir;
+	return 0;
+}
+
+static int send_init_payload_for_stream_dir_list(struct client_sess *sess)
+{
+	constexpr static const char buf[] =
+		"HTTP/1.1 200\r\n"
+		"Content-Type: text/html\r\n"
+		"Connection: closed\r\n\r\n"
+		"<!DOCTYPE html>\n"
+		"<html>\n"
+		"<style type=\"text/css\">"
+			"td {padding: 10px;}"
+			"a {color: blue; text-decoration: none}"
+			"a:hover {text-decoration: underline}"
+		"</style>"
+		"<body>\n"
+		"\t<h1>GNU/Weeb HTTP Server</h1>\n"
+		"\t<table border=\"1\">\n"
+		"\t\t<tr>"
+			"<th>Filename</th>"
+			"<th>Type</th>"
+			"<th>Mode</th>"
+		"</tr>\n";
+
+	int ret;
+
+	ret = send_to_sess(sess, buf, sizeof(buf) - 1);
+	if (unlikely(ret < 0))
+		return -EBADMSG;
+
+	return 0;
+}
+
+static int construct_file_row(const char *path, const char *file, char **pbuf_p,
+			      size_t *capacity_p)
+{
+	char fpath[4096 + 256];
+	const char *type;
+	struct stat st;
+	int ret;
+
+	snprintf(fpath, sizeof(fpath), "%s/%s", path, file);
+
+	ret = stat(fpath, &st);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		fprintf(stderr, "Can't stat \"%s\": %s\n", fpath, strerror(ret));
+		return -ret;
+	}
+
+	if (S_ISDIR(st.st_mode))
+		type = "Directory";
+	else if (S_ISREG(st.st_mode))
+		type = "Regular File";
+	else if (S_ISCHR(st.st_mode))
+		type = "Char dev";
+	else if (S_ISBLK(st.st_mode))
+		type = "Block dev";
+	else if (S_ISFIFO(st.st_mode))
+		type = "FIFO";
+	else if (S_ISLNK(st.st_mode))
+		type = "Symlink";
+	else if (S_ISSOCK(st.st_mode))
+		type = "Socket";
+	else
+		return -ENOTSUP;
+
+	ret = snprintf(*pbuf_p, *capacity_p,
+		"\t\t<tr>"
+			"<td><a href=\"%s%s\">%s</a></td>"
+			"<td>%s</td>"
+			"<td>%d%d%d%d</td>"
+		"</tr>\n",
+		file, S_ISDIR(st.st_mode) ? "/" : "", file,
+		type,
+		(st.st_mode & 07000) >> 9,
+		(st.st_mode & 00700) >> 6,
+		(st.st_mode & 00070) >> 3,
+		(st.st_mode & 00007)
+	);
+	*pbuf_p += (size_t)ret;
+	*capacity_p -= (size_t)ret;
+	return 0;
+}
+
+static int _stream_dir_list_loop(struct stream_dir_list_data *sdld,
+				 char **pbuf_p, size_t *capacity_p)
+{
+	struct dirent *de;
+	const char *f;
+	int ret;
+
+	de = readdir(sdld->dir);
+	if (unlikely(!de))
+		return -1;
+
+	f = de->d_name;
+	if (unlikely(!strcmp(f, ".") || !strcmp(f, "..")))
+		return 0;
+
+	ret = construct_file_row(sdld->path, f, pbuf_p, capacity_p);
+	if (unlikely(ret > 0))
+		return 0;
+
+	return 0;
+}
+
+static int stream_dir_list_queue(struct stream_dir_list_data *sdld_s,
+				 struct client_sess *sess,
+				 struct worker *worker)
+{
+	if (unlikely(!sess->priv_data)) {
+		struct stream_dir_list_data *sdld;
+
+		sdld = new struct stream_dir_list_data;
+		if (unlikely(!sdld))
+			return -EBADMSG;
+
+		*sdld = *sdld_s;
+		sess->priv_data = (void *)sdld;
+	}
+
+	sess->action = HTTP_ACT_DIRLIST;
+	sess->in_queue = true;
+	worker->buf_queue->push(sess->idx);
+	return 0;
+}
+
+constexpr static const char dir_list_foot[] =
+	"\t</table>\n</body>\n</html>\n";
+
+static int send_footer_dir_list(struct client_sess *sess)
+{
+	int ret;
+
+	ret = send_to_sess(sess, dir_list_foot, sizeof(dir_list_foot) - 1);
+	if (unlikely(ret < 0))
+		return ret;
+
+	return 0;
+}
+
+static int stream_dir_list_loop(struct stream_dir_list_data *sdld,
+				struct client_sess *sess,
+				struct worker *worker)
+{
+	bool need_send_footer;
+	char buf[1024 * 128];
+	size_t capacity = sizeof(buf) - 1;
+	size_t send_len;
+	char *pbuf = buf;
+	int ret;
+
+	while (1) {
+
+		if (unlikely(capacity < 8192)) {
+			send_len = sizeof(buf) - 1 - capacity;
+			ret = send_to_sess(sess, buf, send_len);
+			if (unlikely(ret < 0))
+				goto out_close;
+
+			ret = stream_dir_list_queue(sdld, sess, worker);
+			if (unlikely(ret))
+				goto out_close;
+
+			/*
+			 * We are still in the queue loop.
+			 */
+			return 0;
+		}
+
+		ret = _stream_dir_list_loop(sdld, &pbuf, &capacity);
+		if (unlikely(ret))
+			break;
+	}
+
+	if (capacity > sizeof(dir_list_foot) - 1) {
+		capacity -= sizeof(dir_list_foot) - 1;
+		memcpy(pbuf, dir_list_foot, sizeof(dir_list_foot) - 1);
+		need_send_footer = false;
+	} else {
+		need_send_footer = true;
+	}
+
+	send_len = sizeof(buf) - 1 - capacity;
+	if (send_len > 0) {
+		ret = send_to_sess(sess, buf, send_len);
+		if (unlikely(ret < 0))
+			goto out_close;
+	}
+
+	if (need_send_footer) {
+		ret = send_footer_dir_list(sess);
+		if (unlikely(ret))
+			goto out_close;
+	}
+
+	ret = 1;
+
+out_close:
+	closedir(sdld->dir);
+	if (sess->priv_data) {
+		delete (struct stream_dir_list_data *)sess->priv_data;
+		sess->priv_data = NULL;
+	}
+
+	return ret;
+}
+
+static int stream_dir_list(const char *path, struct client_sess *sess,
+			   struct worker *worker)
+{
+	struct stream_dir_list_data sdld;
+	int ret;
+
+	/*
+	 * If we are going to list the directory, the URI path must be
+	 * ended with a trailing slash. We it's not, put the a trailing
+	 * slash by redirecting the client.
+	 */
+	ret = redirect_on_no_trailing_slash(path, sess);
+	if (ret)
+		return ret;
+
+	ret = stream_dir_list_open(path, sess, &sdld.dir);
+	if (unlikely(ret))
+		return ret;
+
+	ret = send_init_payload_for_stream_dir_list(sess);
+	if (unlikely(ret))
+		return ret;
+
+	snprintf(sdld.path, sizeof(sdld.path), "%s", path);
+	return stream_dir_list_loop(&sdld, sess, worker);
+}
+
 static int handle_route_get(struct client_sess *sess, struct worker *worker)
 {
 	char path[4096 + 128];
 	struct stat st;
 	int ret;
+
+	if (likely(sess->need_epl_del)) {
+		sess->need_epl_del = false;
+		uninstall_fd_from_worker(sess->fd, worker);
+	}
 
 	snprintf(path, sizeof(path), "./%s", sess->uri);
 
@@ -1356,37 +1477,13 @@ static int handle_route_get(struct client_sess *sess, struct worker *worker)
 		return -EBADMSG;
 	}
 
-	if (S_ISDIR(st.st_mode)) {
-		size_t plen;
-		size_t lloc;
-		char *loc;
-
-		plen = strlen(path);
-		if (path[plen - 1] == '/')
-			return show_directory_listing(path, sess, worker);
-
-		lloc = plen + 16;
-		if (sess->qs)
-			lloc += strlen(sess->qs) + 2;
-
-		loc = new char[lloc];
-		if (unlikely(!loc))
-			return -ENETDOWN;
-
-		if (sess->qs)
-			snprintf(loc, lloc, "%s/?%s", path, sess->qs);
-		else
-			snprintf(loc, lloc, "%s/", path);
-
-		http_redirect(sess, loc);
-		delete[] loc;
-		return -ENETDOWN;
-	}
+	if (S_ISDIR(st.st_mode))
+		return stream_dir_list(path, sess, worker);
 
 	if (S_ISREG(st.st_mode))
 		return stream_file(path, sess, worker);
 
-	return 0;
+	return -EBADMSG;
 }
 
 static int handle_route(struct client_sess *sess, struct worker *worker)
@@ -1494,9 +1591,13 @@ static __hot int handle_buf_queue(uint32_t idx, struct worker *worker)
 	case HTTP_ACT_NONE:
 		ret = -ENETDOWN;
 		break;
-	case HTTP_ACT_DIRLIST:
-		ret = show_directory_listing(NULL, sess, worker);
+	case HTTP_ACT_DIRLIST: {
+		struct stream_dir_list_data *sdld;
+
+		sdld = (struct stream_dir_list_data *)sess->priv_data;
+		ret = stream_dir_list_loop(sdld, sess, worker);
 		break;
+	}
 	case HTTP_ACT_FILE_STREAM: {
 		struct stream_file_data *sfd;
 
