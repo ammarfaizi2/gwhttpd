@@ -1704,6 +1704,7 @@ static int init_epoll_for_worker(struct worker *worker)
 static __cold int wait_for_worker_online(struct worker *worker)
 {
 	uint32_t i = 0;
+
 	while (!worker->need_join) {
 		usleep(1000);
 		if (i++ < 10000)
