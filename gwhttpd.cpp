@@ -34,9 +34,9 @@
 #define __cold			__attribute__((__cold__))
 #define likely(COND)		__builtin_expect(!!(COND), 1)
 #define unlikely(COND)		__builtin_expect(!!(COND), 0)
-#define NR_WORKERS		4
-#define NR_EPOLL_EVT		4
-#define NR_MAX_CLIENTS		100
+#define NR_WORKERS		16
+#define NR_EPOLL_EVT		512
+#define NR_MAX_CLIENTS		10240
 #define IPV4_LEN		(sizeof("xxx.xxx.xxx.xxx"))
 #define FCIP			"%s:%u"
 #define FCIP_ARG(P)		((P)->src_addr), ((P)->src_port)
