@@ -522,7 +522,6 @@ static int uninstall_fd_from_worker(int fd, struct worker *worker)
 
 	ret = epoll_ctl(worker->epl_fd, EPOLL_CTL_DEL, fd, NULL);
 	if (ret < 0) {
-		__asm__ volatile (".byte 0xcc");
 		ret = -errno;
 		perror("epoll_ctl");
 		return ret;
