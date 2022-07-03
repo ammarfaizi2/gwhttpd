@@ -1254,9 +1254,23 @@ static void handle_range_header(struct client_sess *sess, off_t *start_offset_p)
 		start_bytes = strstr(val, "bytes=");
 		if (start_bytes) {
 			start_bytes += 6;
-			*start_offset_p = strtoull(start_bytes, NULL, 10);
+			*start_offset_p = strtoll(start_bytes, NULL, 10);
 		}
 	}
+}
+
+static void stream_file_bad_req(struct client_sess *sess, const char *msg)
+{
+	char buf[512];
+	int ret;
+
+	ret = snprintf(buf, sizeof(buf),
+			"HTTP/1.1 400 Bad Request\r\n"
+			"Connection: closed\r\n"
+			"Content-Type: text/plain\r\n\r\n"
+			"%s\n\n", msg);
+
+	send_to_sess(sess, buf, (size_t)ret);
 }
 
 static int start_stream_file(const char *file, struct client_sess *sess,
@@ -1272,8 +1286,12 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 	if (unlikely(!map))
 		return -EBADMSG;
 
-
 	handle_range_header(sess, &start_offset);
+	if (start_offset >= sfd.size || start_offset < 0) {
+		stream_file_bad_req(sess, "Bad range offset!");
+		return -EBADMSG;
+	}
+
 	sfd.cur_off = start_offset;
 	ret = send_http_header_for_stream_file(sess, start_offset, st.st_size);
 	if (unlikely(ret))
