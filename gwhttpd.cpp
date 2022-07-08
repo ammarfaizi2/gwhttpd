@@ -176,7 +176,6 @@ struct client_sess {
 	char			*header;
 	char			*body;
 	bool			got_http_header;
-	bool			in_queue;
 	char			src_addr[IPV4_LEN];
 	uint16_t		src_port;
 	char			recv_buf[4096];
@@ -582,7 +581,6 @@ static int _handle_new_client(int tcp_fd, struct worker *worker)
 	sess->got_http_header = false;
 	sess->action = HTTP_ACT_NONE;
 	sess->method = HTTP_NOP;
-	sess->in_queue = false;
 
 	if (addrlen <= sizeof(caddr)) {
 		const char *p;
@@ -1008,7 +1006,6 @@ static int stream_file_loop(struct stream_file_data *sfd,
 	ret = 1;
 
 	if (sfd->cur_off < sfd->size) {
-		sess->in_queue = true;
 		sess->action = HTTP_ACT_FILE_STREAM;
 		worker->buf_queue->push(sess->idx);
 		return 0;
@@ -1330,7 +1327,6 @@ static int stream_dir_list_queue(struct stream_dir_list_data *sdld_s,
 	}
 
 	sess->action = HTTP_ACT_DIRLIST;
-	sess->in_queue = true;
 	worker->buf_queue->push(sess->idx);
 	return 0;
 }
@@ -1528,9 +1524,8 @@ static int _handle_client(struct client_sess *sess, struct worker *worker)
 	ret = handle_route(sess, worker);
 out:
 	if (ret) {
-		if (!sess->in_queue)
-			close_sess(sess, worker);
-		if (likely(ret == -EBADMSG || ret == -ENETDOWN || 
+		close_sess(sess, worker);
+		if (likely(ret == -EBADMSG || ret == -ENETDOWN ||
 			   ret == -ECONNRESET || ret == -EPIPE ||
 			   ret == 1))
 			ret = 0;
@@ -1544,9 +1539,6 @@ static int handle_client(struct client_sess *sess, struct worker *worker)
 	size_t len;
 	char *buf;
 	int ret;
-
-	if (unlikely(sess->in_queue))
-		return 0;
 
 	len = sizeof(sess->recv_buf) - 1 - sess->rbuf_len;
 	buf = &sess->recv_buf[sess->rbuf_len];
