@@ -1895,7 +1895,7 @@ static int connect_tcp_sock(int fd, const char *addr, uint16_t port)
 	dst_addr.sin_port = htons(port);
 	dst_addr.sin_addr.s_addr = inet_addr(addr);
 
-	printf("SLC Connecting to %s:%u...\n", addr, port);
+	// printf("SLC Connecting to %s:%u...\n", addr, port);
 	err = connect(fd, (struct sockaddr *)&dst_addr, sizeof(dst_addr));
 	if (err < 0) {
 		err = errno;
@@ -1903,7 +1903,7 @@ static int connect_tcp_sock(int fd, const char *addr, uint16_t port)
 		return -err;
 	}
 	err = setup_socket(fd);
-	printf("SLC Connected!\n");
+	// printf("SLC Connected!\n");
 	return 0;
 }
 
@@ -1917,11 +1917,11 @@ static int recv_and_send(int fd_in, int fd_out, int *pipes, size_t len)
 	read_ret = splice(fd_in, NULL, pipes[1], NULL, len, fl);
 	if (unlikely(read_ret <= 0)) {
 		if (read_ret == 0) {
-			puts("fd_in is down");
+			// puts("fd_in is down");
 			return -ENETDOWN;
 		}
 		ret = errno;
-		perror("splice fd_in");
+		// perror("splice fd_in");
 		return -ret;
 	}
 
@@ -1929,11 +1929,11 @@ do_write:
 	write_ret = splice(pipes[0], NULL, fd_out, NULL, read_ret, fl);
 	if (unlikely(write_ret <= 0)) {
 		if (write_ret == 0) {
-			puts("fd_out is down");
+			// puts("fd_out is down");
 			return -ENETDOWN;
 		}
 		ret = errno;
-		perror("splice fd_out");
+		// perror("splice fd_out");
 		return -ret;
 	}
 
@@ -2062,7 +2062,7 @@ do_recv:
 	ret = recv(fd_circuit, &pkt, sizeof(pkt), 0);
 	if (unlikely(ret <= 0)) {
 		if (ret == 0) {
-			puts("Server has been disconnected!");
+			puts("SLC Server has been disconnected!");
 			return -ENETDOWN;
 		}
 		err = errno;
@@ -2137,7 +2137,7 @@ repeat:
 	if (atomic_load(&g_slc_stop))
 		return ret;
 
-	puts("Sleeing for 3 seconds...");
+	puts("SLC: Sleeping for 3 seconds before reconnecting...");
 	sleep(3);
 	goto repeat;
 }
