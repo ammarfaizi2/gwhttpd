@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <getopt.h>
 
 #define noinline		__attribute__((__noinline__))
 #define __hot			__attribute__((__hot__))
@@ -1799,23 +1800,24 @@ static __cold void destroy_state(struct server_state *state)
 	free_state(state);
 }
 
-int main(int argc, char *argv[])
+struct cmd_arg {
+	const char		*bind_addr;
+	const char		*bind_port;
+	const char		*slc_circuit_addr;
+	const char		*slc_circuit_port;
+};
+
+static int _main(struct cmd_arg *arg)
 {
 	struct server_state *state = NULL;
 	int ret;
-
-	setvbuf(stdout, NULL, _IOLBF, 4096);
-	if (argc != 3) {
-		printf("Usage: %s [bind_address] [bind_port]\n", argv[0]);
-		return 0;
-	}
 
 	ret = init_state(&state);
 	if (unlikely(ret))
 		return ret;
 
-	state->bind_addr = argv[1];
-	state->bind_port = (uint16_t)atoi(argv[2]);
+	state->bind_addr = arg->bind_addr;
+	state->bind_port = (uint16_t)atoi(arg->bind_port);
 
 	ret = init_socket(state);
 	if (unlikely(ret))
@@ -1824,4 +1826,110 @@ int main(int argc, char *argv[])
 out:
 	destroy_state(state);
 	return ret;
+}
+
+static const struct option long_options[] = {
+	{"bind-addr",		required_argument,	0,	'h'},
+	{"bind-port",		required_argument,	0,	'p'},
+	{"slc-addr",		required_argument,	0,	'H'},
+	{"slc-port",		required_argument,	0,	'P'},
+	{NULL,			0,			0,	0}
+};
+
+static __cold int _parse_cmd_arg(int argc, char *argv[], struct cmd_arg *arg)
+{
+	int opt_idx;
+	int c;
+
+	c = getopt_long(argc, argv, "h:p:H:P:", long_options, &opt_idx);
+	if (c == -1)
+		return 1;
+
+	switch (c) {
+	case 'h':
+		arg->bind_addr = optarg;
+		break;
+	case 'p':
+		arg->bind_port = optarg;
+		break;
+	case 'H':
+		arg->slc_addr = optarg;
+		break;
+	case 'P':
+		arg->slc_port = optarg;
+		break;
+	default:
+		printf("Unknown option: %s\n", optarg);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static __cold int parse_cmd_arg(int argc, char *argv[], struct cmd_arg *arg)
+{
+	int ret;
+
+	while (1) {
+		ret = _parse_cmd_arg(argc, argv, arg);
+		if (ret)
+			break;
+	}
+
+	if (ret == 1)
+		return 0;
+
+	return ret;
+}
+
+static noinline __cold void show_help(const char *app)
+{
+	putchar('\n');
+	puts("Usage:\n");
+	printf("   %s [options]\n\n", app);
+	puts("Options:");
+	puts("  -h,--bind-addr=<addr>\tSet gwhttpd bind address");
+	puts("  -p,--bind-port=<port>\tSet gwhttpd bind port");
+	puts("  -H,--slc-addr=<addr>\tSet gwhttpd SLC address");
+	puts("  -P,--slc-port=<port>\tSet gwhttpd SLC port");
+	puts("\n");
+	puts("GitHub repo: https://github.com/ammarfaizi2/gwhttpd.git\n");
+	puts("Copyright (C) 2022 Ammar Faizi <ammarfaizi2@gnuweeb.org>");
+	puts("This is free software; see the source for copying conditions.  There is NO");
+	puts("warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n");
+}
+
+int main(int argc, char *argv[])
+{
+	struct cmd_arg arg;
+	int ret;
+
+	setvbuf(stdout, NULL, _IOLBF, 4096);
+	if (argc == 1) {
+		show_help(argv[0]);
+		return EINVAL;
+	}
+
+	memset(&arg, 0, sizeof(arg));
+	ret = parse_cmd_arg(argc, argv, &arg);
+	if (unlikely(ret)) {
+		if (ret < 0)
+			ret = -ret;
+		show_help(argv[0]);
+		return ret;
+	}
+
+	if (!arg.bind_addr) {
+		puts("Error: Missing bind_addr!");
+		show_help(argv[0]);
+		return EINVAL;
+	}
+
+	if (!arg.bind_port) {
+		puts("Error: Missing bind_port!");
+		show_help(argv[0]);
+		return EINVAL;
+	}
+
+	return _main(&arg);
 }
