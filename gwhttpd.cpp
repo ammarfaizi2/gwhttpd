@@ -1909,7 +1909,6 @@ static int connect_tcp_sock(int fd, const char *addr, uint16_t port)
 	dst_addr.sin_port = htons(port);
 	dst_addr.sin_addr.s_addr = inet_addr(addr);
 
-	// printf("SLC Connecting to %s:%u...\n", addr, port);
 	err = connect(fd, (struct sockaddr *)&dst_addr, sizeof(dst_addr));
 	if (err < 0) {
 		err = errno;
@@ -1917,7 +1916,6 @@ static int connect_tcp_sock(int fd, const char *addr, uint16_t port)
 		return -err;
 	}
 	err = setup_socket(fd);
-	// printf("SLC Connected!\n");
 	return 0;
 }
 
@@ -2118,6 +2116,7 @@ static int _run_slc_client(const char *target_addr, uint16_t target_port,
 	if (unlikely(fd_circuit < 0))
 		return -fd_circuit;
 
+	printf("SLC: Connecting to %s:%u...\n", server_addr, server_port);
 	err = connect_tcp_sock(fd_circuit, server_addr, server_port);
 	if (unlikely(err))
 		goto out;
@@ -2126,6 +2125,7 @@ static int _run_slc_client(const char *target_addr, uint16_t target_port,
 	if (unlikely(err))
 		goto out;
 
+	printf("SLC: Connected to the server!\n");
 	err = handle_private_conn(fd_circuit, target_addr, target_port,
 				  server_addr, server_port);
 out:
