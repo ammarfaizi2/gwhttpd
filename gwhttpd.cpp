@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <getopt.h>
+#include <netinet/tcp.h>
 
 #define noinline		__attribute__((__noinline__))
 #define __hot			__attribute__((__hot__))
@@ -1803,21 +1804,371 @@ static __cold void destroy_state(struct server_state *state)
 struct cmd_arg {
 	const char		*bind_addr;
 	const char		*bind_port;
-	const char		*slc_circuit_addr;
-	const char		*slc_circuit_port;
+	const char		*slc_addr;
+	const char		*slc_port;
 };
+
+static std::atomic<bool> g_slc_stop;
+#define PKT_DATA_BUFFER 1024
+
+struct slc_packet {
+	uint8_t		type;
+	uint8_t		pad;
+	uint16_t	len;
+	uint8_t		data[PKT_DATA_BUFFER];
+};
+
+struct client_private_data {
+	struct slc_packet	pkt;
+	const char		*server_addr;
+	const char		*target_addr;
+	uint16_t		target_port;
+	uint16_t		server_port;
+};
+
+enum {
+	PKT_TYPE_SERVER_GET_A_REAL_CLIENT,
+	PKT_TYPE_CLIENT_INIT_CIRCUIT,
+	PKT_TYPE_CLIENT_START_PRIVATE_SOCK
+};
+
+static int create_tcp_sock(void)
+{
+	int fd;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) {
+		fd = errno;
+		perror("socket");
+		return -fd;
+	}
+	return fd;
+}
+
+static int start_circuit(int fd_circuit)
+{
+	struct slc_packet pkt;
+	ssize_t ret;
+	int err;
+
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.type = PKT_TYPE_CLIENT_INIT_CIRCUIT;
+	ret = send(fd_circuit, &pkt, sizeof(pkt), 0);
+	if (unlikely(ret < 0)) {
+		err = errno;
+		perror("send");
+		return -err;
+	}
+	return 0;
+}
+
+static int setup_socket(int fd)
+{
+	int ret, y;
+	size_t len = sizeof(y);
+
+	/*
+	 * Ignore any error from these calls. They are not mandatory.
+	 */
+	y = 1;
+	ret = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (void *)&y, len);
+	if (unlikely(ret < 0)) {
+		perror("setsockopt(IPPROTO_TCP, TCP_NODELAY)");
+		puts("Failed to set TCP nodelay, but this is fine.");
+	}
+
+	y = 1024 * 1024 * 100;
+	ret = setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, (void *)&y, len);
+	y = 1024 * 1024 * 100;
+	ret = setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, (void *)&y, len);
+
+	return 0;
+}
+
+static int connect_tcp_sock(int fd, const char *addr, uint16_t port)
+{
+	struct sockaddr_in dst_addr;
+	int err;
+
+	memset(&dst_addr, 0, sizeof(dst_addr));
+	dst_addr.sin_family = AF_INET;
+	dst_addr.sin_port = htons(port);
+	dst_addr.sin_addr.s_addr = inet_addr(addr);
+
+	printf("SLC Connecting to %s:%u...\n", addr, port);
+	err = connect(fd, (struct sockaddr *)&dst_addr, sizeof(dst_addr));
+	if (err < 0) {
+		err = errno;
+		perror("connect");
+		return -err;
+	}
+	err = setup_socket(fd);
+	printf("SLC Connected!\n");
+	return 0;
+}
+
+static int recv_and_send(int fd_in, int fd_out, int *pipes, size_t len)
+{
+	unsigned int fl = SPLICE_F_MOVE | SPLICE_F_NONBLOCK;
+	ssize_t read_ret;
+	ssize_t write_ret;
+	int ret;
+
+	read_ret = splice(fd_in, NULL, pipes[1], NULL, len, fl);
+	if (unlikely(read_ret <= 0)) {
+		if (read_ret == 0) {
+			puts("fd_in is down");
+			return -ENETDOWN;
+		}
+		ret = errno;
+		perror("splice fd_in");
+		return -ret;
+	}
+
+do_write:
+	write_ret = splice(pipes[0], NULL, fd_out, NULL, read_ret, fl);
+	if (unlikely(write_ret <= 0)) {
+		if (write_ret == 0) {
+			puts("fd_out is down");
+			return -ENETDOWN;
+		}
+		ret = errno;
+		perror("splice fd_out");
+		return -ret;
+	}
+
+	read_ret -= write_ret;
+	if (unlikely(read_ret > 0))
+		goto do_write;
+
+	return 0;
+}
+
+static int socket_bridge(int fd1, int fd2)
+{
+	static const size_t len = 1024 * 1024;
+	struct pollfd fds[2];
+	int pipes[2] = {-1, -1};
+	int ret;
+
+	if (pipe(pipes)) {
+		ret = errno;
+		perror("pipe");
+		return -ret;
+	}
+
+	fds[0].fd = fd1;
+	fds[0].events = POLLIN | POLLPRI;
+	fds[1].fd = fd2;
+	fds[1].events = POLLIN | POLLPRI;
+
+do_poll:
+	if (atomic_load(&g_slc_stop)) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = poll(fds, 2, 1000);
+	if (unlikely(ret < 0)) {
+		ret = errno;
+		perror("poll");
+		goto out;
+	}
+
+	if (ret == 0)
+		goto do_poll;
+
+	if (fds[0].revents & POLLIN) {
+		ret = recv_and_send(fd1, fd2, pipes, len);
+		if (unlikely(ret < 0))
+			goto out;
+	}
+
+	if (fds[1].revents & POLLIN) {
+		ret = recv_and_send(fd2, fd1, pipes, len);
+		if (unlikely(ret < 0))
+			goto out;
+	}
+	goto do_poll;
+
+out:
+	if (pipes[0] != -1)
+		close(pipes[0]);
+	if (pipes[1] != -1)
+		close(pipes[1]);
+	return ret;
+}
+
+static void *start_private_conn(void *pp)
+{
+	struct client_private_data *p = (struct client_private_data *)pp;
+	int fd_pa = -1, fd_pb = -1;
+	int err = 0;
+	ssize_t ret;
+
+	fd_pa = create_tcp_sock();
+	if (unlikely(fd_pa < 0)) {
+		err = fd_pa;
+		goto out_free;
+	}
+
+	fd_pb = create_tcp_sock();
+	if (unlikely(fd_pb < 0)) {
+		err = fd_pb;
+		goto out_free;
+	}
+
+	err = connect_tcp_sock(fd_pa, p->server_addr, p->server_port);
+	if (unlikely(err))
+		goto out_free;
+
+	err = connect_tcp_sock(fd_pb, p->target_addr, p->target_port);
+	if (unlikely(err))
+		goto out_free;
+
+	p->pkt.type = PKT_TYPE_CLIENT_START_PRIVATE_SOCK;
+	ret = send(fd_pa, &p->pkt, sizeof(p->pkt), 0);
+	if (unlikely(ret < 0)) {
+		err = errno;
+		perror("send");
+		goto out_free;
+	}
+
+out_free:
+	delete p;
+	if (err)
+		goto out;
+
+	socket_bridge(fd_pa, fd_pb);
+out:
+	if (fd_pa != -1)
+		close(fd_pa);
+	if (fd_pb != -1)
+		close(fd_pb);
+	return NULL;
+}
+
+static int handle_private_conn(int fd_circuit, const char *target_addr,
+			       uint16_t target_port, const char *server_addr,
+			       uint16_t server_port)
+{
+	struct client_private_data *pp;
+	struct slc_packet pkt;
+	pthread_t thread;
+	ssize_t ret;
+	int err;
+
+do_recv:
+	ret = recv(fd_circuit, &pkt, sizeof(pkt), 0);
+	if (unlikely(ret <= 0)) {
+		if (ret == 0) {
+			puts("Server has been disconnected!");
+			return -ENETDOWN;
+		}
+		err = errno;
+		perror("recv");
+		return -err;
+	}
+
+	pp = new struct client_private_data;
+	if (unlikely(!pp))
+		return -ENOMEM;
+
+	pp->pkt = pkt;
+	pp->server_addr = server_addr;
+	pp->server_port = server_port;
+	pp->target_addr = target_addr;
+	pp->target_port = target_port;
+	err = pthread_create(&thread, NULL, start_private_conn, pp);
+	if (unlikely(ret < 0)) {
+		errno = ret;
+		perror("pthread_create");
+		delete pp;
+		return -ret;
+	}
+	pthread_detach(thread);
+
+	if (!atomic_load(&g_slc_stop))
+		goto do_recv;
+
+	return 0;
+}
+
+static int _run_slc_client(const char *target_addr, uint16_t target_port,
+			   const char *server_addr, uint16_t server_port)
+{
+	int fd_circuit = -1;
+	int err;
+
+	fd_circuit = create_tcp_sock();
+	if (unlikely(fd_circuit < 0))
+		return -fd_circuit;
+
+	err = connect_tcp_sock(fd_circuit, server_addr, server_port);
+	if (unlikely(err))
+		goto out;
+
+	err = start_circuit(fd_circuit);
+	if (unlikely(err))
+		goto out;
+
+	err = handle_private_conn(fd_circuit, target_addr, target_port,
+				  server_addr, server_port);
+out:
+	close(fd_circuit);
+	return (err < 0) ? -err : err;
+}
+
+static int run_slc_client(const char *target_addr, uint16_t target_port,
+			  const char *server_addr, uint16_t server_port)
+{
+	int ret = 0;
+
+	atomic_store(&g_slc_stop, false);
+
+repeat:
+	ret = _run_slc_client(target_addr, target_port, server_addr,
+			      server_port);
+	if (unlikely(ret)) {
+		errno = ret;
+		perror("_run_slc_client()");
+	}
+
+	if (atomic_load(&g_slc_stop))
+		return ret;
+
+	puts("Sleeing for 3 seconds...");
+	sleep(3);
+	goto repeat;
+}
 
 static int _main(struct cmd_arg *arg)
 {
 	struct server_state *state = NULL;
+	uint16_t bport = (uint16_t)atoi(arg->bind_port);
+	pid_t slc_pid = -1;
 	int ret;
+
+	if (arg->slc_addr && arg->slc_port) {
+		slc_pid = fork();
+		if (slc_pid < 0) {
+			ret = errno;
+			perror("fork()");
+			return -ret;
+		}
+
+		if (!slc_pid)
+			return run_slc_client(arg->bind_addr, bport,
+					      arg->slc_addr,
+					      (uint16_t)atoi(arg->slc_port));
+	}
 
 	ret = init_state(&state);
 	if (unlikely(ret))
 		return ret;
 
 	state->bind_addr = arg->bind_addr;
-	state->bind_port = (uint16_t)atoi(arg->bind_port);
+	state->bind_port = bport;
 
 	ret = init_socket(state);
 	if (unlikely(ret))
@@ -1825,6 +2176,9 @@ static int _main(struct cmd_arg *arg)
 	ret = run_workers(state);
 out:
 	destroy_state(state);
+	if (slc_pid > 0)
+		kill(slc_pid, SIGTERM);
+
 	return ret;
 }
 
