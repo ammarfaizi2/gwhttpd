@@ -888,6 +888,7 @@ static char *open_file_for_stream(const char *file, struct stat *st,
 				  struct client_sess *sess,
 				  struct stream_file_data *sfd)
 {
+	size_t mmap_size;
 	char *map;
 	int ret;
 	int fd;
@@ -911,7 +912,12 @@ static char *open_file_for_stream(const char *file, struct stat *st,
 		return NULL;
 	}
 
-	map = (char *)mmap(NULL, st->st_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (st->st_size == 0)
+		mmap_size = 1;
+	else
+		mmap_size = st->st_size;
+
+	map = (char *)mmap(NULL, mmap_size, PROT_READ, MAP_SHARED, fd, 0);
 	close(fd);
 	if (unlikely(map == MAP_FAILED)) {
 		ret = errno;
@@ -1071,14 +1077,22 @@ static int start_stream_file(const char *file, struct client_sess *sess,
 
 	handle_range_header(sess, &start_offset);
 	if (start_offset >= sfd.size || start_offset < 0) {
+		if (sfd.size == 0)
+			goto send_hdr;
 		stream_file_bad_req(sess, "Bad range offset!");
 		return -EBADMSG;
 	}
 
+send_hdr:
 	sfd.cur_off = start_offset;
 	ret = send_http_header_for_stream_file(sess, start_offset, st.st_size);
 	if (unlikely(ret))
 		return -EBADMSG;
+
+	if (sfd.size == 0) {
+		munmap(sfd.map, 1);
+		return 1;
+	}
 
 	if (st.st_size <= max_send_len_file) {
 		ret = stream_file_once(&sfd, sess);
