@@ -831,7 +831,7 @@ out_put_client:
 	gwnet_tcp_srv_put_client(w, c);
 out_close:
 	close(fd);
-	return ret;
+	return 0;
 }
 
 static int gwnet_tcp_srv_handle_eventfd(struct gwnet_tcp_srv_wrk *w)
