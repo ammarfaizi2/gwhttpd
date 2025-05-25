@@ -956,10 +956,10 @@ static int gwnet_tcp_srv_handle_client_out(struct gwnet_tcp_srv_wrk *w,
 			return ret;
 	}
 
-	if (c->tx_buf.len == 0 && (ev->events & EPOLLOUT)) {
+	if (c->tx_buf.len == 0 && (c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLIN;
 		need_epctl = true;
-	} else if (c->tx_buf.len > 0 && !(ev->events & EPOLLOUT)) {
+	} else if (c->tx_buf.len > 0 && !(c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLOUT | EPOLLIN;
 		need_epctl = true;
 	}
