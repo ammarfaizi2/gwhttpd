@@ -1,5 +1,5 @@
 
-CFLAGS = -Wall -Wextra -Os -g -fsanitize=address
+CFLAGS = -Wall -Wextra -Os -g -fno-strict-aliasing -ffunction-sections -fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector
 LDFLAGS =
 LIBS = -lpthread
 
