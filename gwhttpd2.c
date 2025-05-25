@@ -1626,15 +1626,15 @@ static int gwnet_http_recv_cb(void *data, struct gwnet_tcp_srv *s,
 			break;
 		}
 
+		if (!ret && hc->state == GWNET_HTTP_CLI_ST_REQ_OK) {
+			/*
+			 * We have a complete request, process it!
+			 */
+			ret = gwnet_http_recv_cb_req_ok(c, hc, b);
+		}
+
 		if (ret < 0)
 			break;
-	}
-
-	if (!ret && hc->state == GWNET_HTTP_CLI_ST_REQ_OK) {
-		/*
-		 * We have a complete request, process it!
-		 */
-		ret = gwnet_http_recv_cb_req_ok(c, hc, b);
 	}
 
 	return ret;
