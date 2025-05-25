@@ -320,7 +320,7 @@ static int gwstack16_pop(struct gwstack16 *s, uint16_t *v)
 	return ret;
 }
 
-#define NR_CLIENTS_PER_BUCKET 4096
+#define NR_CLIENTS_PER_BUCKET 30000
 
 static int gwnet_tcp_srv_init_client_bucket(struct gwnet_tcp_srv *s)
 {
