@@ -1644,6 +1644,17 @@ static int gwnet_http_send_cb(void *data, struct gwnet_tcp_srv *s,
 	return 0;
 }
 
+static int gwnet_http_send_cb_post(void *data, struct gwnet_tcp_srv *s,
+				   struct gwnet_tcp_cli *c, struct gwbuf *b)
+{
+	struct gwnet_http_cli *hc = data;
+
+	if (b->len == 0 && !hc->keep_alive)
+		return -ECONNRESET;
+
+	return 0;
+}
+
 static void gwnet_http_cli_free_cb(void *data, struct gwnet_tcp_cli *c)
 {
 	struct gwnet_http_cli *hc = data;
@@ -1663,6 +1674,7 @@ static int gwnet_http_accept_cb(void *data, struct gwnet_tcp_srv *s,
 	gwnet_tcp_srv_cli_set_data(c, hc);
 	gwnet_tcp_srv_cli_set_post_recv_cb(c, gwnet_http_recv_cb);
 	gwnet_tcp_srv_cli_set_pre_send_cb(c, gwnet_http_send_cb);
+	gwnet_tcp_srv_cli_set_post_send_cb(c, gwnet_http_send_cb_post);
 	gwnet_tcp_srv_cli_set_free_cb(c, gwnet_http_cli_free_cb);
 	return 0;
 }
