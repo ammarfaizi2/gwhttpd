@@ -690,6 +690,7 @@ static int gwnet_tcp_srv_put_client(struct gwnet_tcp_srv_wrk *w,
 	 */
 	gwnet_tcp_srv_free_client(c);
 	gwstack16_push(&ctx->clients.stack, c - ctx->clients.arr);
+	atomic_fetch_sub(&w->nr_on_clients, 1ull);
 
 	if (unlikely(ctx->accept_stopped)) {
 		int ret, ep_fd = ctx->workers[0].ep_fd;
