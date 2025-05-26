@@ -928,7 +928,6 @@ static int gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 
 	len = c->tx_buf.len;
 	buf = c->tx_buf.buf;
-
 	ret = send(c->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
 	if (ret < 0) {
 		ret = -errno;
@@ -1805,6 +1804,7 @@ static int gwnet_http_recv_cb_req_ok(struct gwnet_tcp_cli *c,
 				     struct gwnet_http_cli *hc,
 				     struct gwbuf *b)
 {
+	const char *conn = hc->keep_alive ? "keep-alive" : "close";
 	struct gwnet_http_req *req = hc->req_tail;
 	struct gwbuf *s = &c->tx_buf;
 	int r = 0;
@@ -1812,7 +1812,7 @@ static int gwnet_http_recv_cb_req_ok(struct gwnet_tcp_cli *c,
 	r |= gwbuf_apfmt(s, "HTTP/1.%d 200 OK\r\n", req->version);
 	r |= gwbuf_apfmt(s, "Content-Length: 13\r\n");
 	r |= gwbuf_apfmt(s, "Content-Type: text/plain\r\n");
-	r |= gwbuf_apfmt(s, "Connection: %s\r\n", hc->keep_alive ? "keep-alive" : "close");
+	r |= gwbuf_apfmt(s, "Connection: %s\r\n", conn);
 	r |= gwbuf_apfmt(s, "\r\n");
 	r |= gwbuf_apfmt(s, "Hello World!\n");
 
