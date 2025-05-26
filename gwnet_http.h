@@ -31,8 +31,13 @@ struct gwnet_http_hdr {
 };
 
 struct gwnet_http_srv;
+struct gwnet_http_cli;
+struct gwnet_http_req;
 
 typedef struct gwnet_http_srv gwnet_http_srv_t;
+typedef int (*gwnet_http_srv_route_cb_t)(struct gwnet_http_srv *srv,
+					 struct gwnet_http_cli *hc,
+					 struct gwnet_http_req *req);
 
 const char *gwnet_http_hdr_get_val(struct gwnet_http_hdr *hdr, const char *key);
 int gwnet_http_hdr_addf(struct gwnet_http_hdr *hdr, const char *key,
