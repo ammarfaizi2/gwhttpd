@@ -3,7 +3,9 @@
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
 
+#define GWNET_HTTP_DEFINE_SHORT_NAMES
 #include "gwnet_http.h"
+#include "gwbuf.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -158,6 +160,94 @@ static int parse_arg_and_init(int argc, char *argv[], gwnet_http_srv_t **srv_p)
 	return 0;
 }
 
+static char *trim_char(char *str, char c)
+{
+	char *end;
+
+	if (!str || !*str)
+		return str;
+
+	// Trim leading characters
+	while (*str == c)
+		str++;
+
+	// Trim trailing characters
+	end = str + strlen(str) - 1;
+	while (end > str && *end == c)
+		end--;
+
+	// Null-terminate the trimmed string
+	end[1] = '\0';
+
+	return str;
+}
+
+struct rt_ctx {
+	struct gwnet_http_srv *srv;
+	struct gwnet_http_cli *hc;
+	struct gwnet_http_req *req;
+	struct gwnet_http_res *res;
+};
+
+static int route_hello_world(struct rt_ctx *ctx)
+{
+	struct gwnet_http_res *res = ctx->res;
+	struct gwbuf *b = hres_get_body_buf(res);
+
+	hres_set_content_type(res, "text/plain");
+	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_BUF);
+	gwbuf_apfmt(b, "Hello world!\n");
+	hres_set_code(res, 200);
+	return 0;
+}
+
+static int route_zero(struct rt_ctx *ctx)
+{
+	struct gwnet_http_res *res = hres_get(ctx->hc);
+
+	hres_set_content_type(res, "application/octet-stream");
+	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_ZERO);
+	hres_set_zero_len(res, 1024ull * 1024 * 1024 * 30);
+	hres_set_code(res, 200);
+	return 0;
+}
+
+static int route_404(struct rt_ctx *ctx)
+{
+	struct gwnet_http_res *res = ctx->res;
+
+	hres_set_content_type(res, "text/plain");
+	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_BUF);
+	gwbuf_apfmt(hres_get_body_buf(res), "404 Not Found\n");
+	hres_set_code(res, 404);
+	return 0;
+}
+
+static int handle_route(struct gwnet_http_srv *srv, struct gwnet_http_cli *hc)
+{
+	struct gwnet_http_req *req = hreq_get(hc);
+	struct gwnet_http_res *res = hres_get(hc);
+	struct rt_ctx ctx = {
+		.srv = srv,
+		.hc = hc,
+		.req = req,
+		.res = res,
+	};
+	char *uri = hreq_get_nc_uri(req);
+
+	if (!uri)
+		return -EINVAL;
+
+	uri = trim_char(uri, '/');
+	if (!*uri)
+		return route_hello_world(&ctx);
+
+	if (!strcmp(uri, "zero"))
+		return route_zero(&ctx);
+
+	return route_404(&ctx);
+}
+
 int main(int argc, char *argv[])
 {
 	gwnet_http_srv_t *srv;
@@ -167,6 +257,7 @@ int main(int argc, char *argv[])
 	if (ret)
 		return -ret;
 
+	gwnet_http_srv_set_route_cb(srv, handle_route, NULL);
 	ret = gwnet_http_srv_run(srv);
 	gwnet_http_srv_free(srv);
 	return -ret;
