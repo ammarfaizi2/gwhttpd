@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+#include <assert.h>
 #include <stdio.h>
 #include <errno.h>
 
@@ -32,6 +33,13 @@
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
+
+#define MIN_T(TYPE, A, B)		\
+({					\
+	TYPE ___a = (A);		\
+	TYPE ___b = (B);		\
+	((___a < ___b) ? ___a : ___b);	\
+})
 
 #define pr_log(fmt, ...) printf(fmt, ##__VA_ARGS__)
 
@@ -201,6 +209,26 @@ static void gwbuf_advance(struct gwbuf *b, size_t len)
 	b->buf[b->len] = '\0';
 }
 
+static int gwbuf_set_cap(struct gwbuf *b, size_t cap)
+{
+	char *new_buf;
+
+	if (cap == b->cap)
+		return 0;
+
+	new_buf = realloc(b->buf, cap + 1);
+	if (!new_buf)
+		return -ENOMEM;
+
+	b->buf = new_buf;
+	b->cap = cap;
+	if (b->len > b->cap)
+		b->len = b->cap;
+
+	b->buf[b->len] = b->buf[b->cap] = '\0';
+	return 0;
+}
+
 static int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 {
 	va_list args, args2;
@@ -218,6 +246,7 @@ static int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 	ret = vsnprintf(b->buf + b->len, b->cap - b->len + 1, fmt, args);
 	b->len += ret;
 	b->buf[b->len] = '\0';
+	ret = 0;
 out:
 	va_end(args);
 	return ret;
@@ -930,7 +959,7 @@ static int gwnet_tcp_srv_handle_client_in(struct gwnet_tcp_srv_wrk *w,
 	if (c->tx_buf.len > 0)
 		ev->events |= EPOLLOUT;
 
-	return 0;
+	return ret;
 }
 
 static int gwnet_tcp_srv_handle_client_out(struct gwnet_tcp_srv_wrk *w,
@@ -1163,6 +1192,14 @@ enum {
 	GWNET_HTTP_METHOD_UNKNOWN	= 100,
 };
 
+enum {
+	GWNET_HTTP_CHUNK_ST_NONE	= 0,
+	GWNET_HTTP_CHUNK_ST_LEN		= 1,
+	GWNET_HTTP_CHUNK_ST_DATA	= 2,
+	GWNET_HTTP_CHUNK_ST_TRAILER	= 3,
+	GWNET_HTTP_CHUNK_ST_END		= 4,
+};
+
 struct gwnet_http_hdr_pair {
 	char	*key;
 	char	*val;
@@ -1183,7 +1220,9 @@ struct gwnet_http_res {
 struct gwnet_http_req {
 	uint8_t			method;
 	uint8_t			version;
-	uint64_t		body_len;
+	uint8_t			chunk_state;
+	bool			body_oversized;
+	uint64_t		missing_body_len;
 	struct gwbuf		body_buf;
 	struct gwnet_http_hdr	hdr;
 	struct gwnet_http_res	res;
@@ -1519,14 +1558,16 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 				return -EINVAL;
 		} else if (!strcmp(k, "content-length")) {
 			char *ep;
-			req->body_len = strtoull(v, &ep, 10);
+			req->missing_body_len = strtoull(v, &ep, 10);
 			if (*ep != '\0')
 				return -EINVAL;
 		} else if (!strcmp(k, "transfer-encoding")) {
-			if (strstr(v, "chunked"))
-				req->body_len = GWNET_HTTP_BODY_LEN_CHUNKED;
-			else
+			if (strstr(v, "chunked")) {
+				req->missing_body_len = 0;
+				req->chunk_state = GWNET_HTTP_CHUNK_ST_LEN;
+			} else {
 				return -EINVAL;
+			}
 		}
 
 		ret = gwnet_http_hdr_add(&req->hdr, k, v);
@@ -1538,10 +1579,11 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 			break;
 	}
 
-	if (req->body_len != 0) {
-		if (req->body_len > GWNET_HTTP_BODY_MAX_LEN)
-			return -EINVAL;
-		if (gwbuf_init(&req->body_buf, req->body_len) < 0)
+	if (req->missing_body_len || req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE) {
+		size_t alloc = req->missing_body_len;
+		if (alloc > GWNET_HTTP_BODY_MAX_LEN)
+			alloc = GWNET_HTTP_BODY_MAX_LEN;
+		if (gwbuf_init(&req->body_buf, alloc) < 0)
 			return -ENOMEM;
 		hc->state = GWNET_HTTP_CLI_ST_REQ_BODY;
 	} else {
@@ -1552,31 +1594,210 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 	return 0;
 }
 
+static bool str_is_hexdigit(const char *x)
+{
+	while (1) {
+		char c = *x;
+		if (!c)
+			break;
+
+		if (!((c >= '0' && c <= '9') ||
+		      (c >= 'a' && c <= 'f') ||
+		      (c >= 'A' && c <= 'F')))
+			return false;
+
+		x++;
+	}
+	return true;
+}
+
+static int
+
+gwnet_http_recv_cb_req_body_chunked_len(struct gwnet_http_req *req,
+					   struct gwbuf *b)
+{
+	char *cr, *endp;
+
+	assert(req->missing_body_len == 0);
+
+	/*
+	 * Shortest chunk size is 1 hex digit plus CRLF (3 bytes).
+	 */
+	if (b->len < 3)
+		return -EAGAIN;
+
+	/*
+	 * Look for CR marking end of hex length field.
+	 */
+	cr = memchr(b->buf, '\r', b->len);
+	if (!cr) {
+		/*
+		 * Too many hex digits or invalid character?
+		 */
+		if (b->len > 16 || !str_is_hexdigit(b->buf))
+			return -EINVAL;
+
+		/*
+		 * Still waiting for CRLF.
+		 */
+		return -EAGAIN;
+	}
+
+	/*
+	 * Ensure LF follows CR and is within buffer.
+	 */
+	if ((size_t)(cr - b->buf) + 2 > b->len)
+		return -EAGAIN;
+	if (cr[1] != '\n')
+		return -EINVAL;
+
+	/*
+	 * Null-terminate the length string and parse.
+	 */
+	*cr = '\0';
+	req->missing_body_len = strtoull(b->buf, &endp, 16);
+	if (*endp != '\0')
+		return -EINVAL;
+
+	req->chunk_state =
+		req->missing_body_len == 0 ?
+			GWNET_HTTP_CHUNK_ST_END :
+			GWNET_HTTP_CHUNK_ST_DATA;
+
+	/*
+	 * Consume the length line and CRLF.
+	 */
+	gwbuf_advance(b, (cr - b->buf) + 2);
+	return 0;
+}
+
+static int __gwnet_http_recv_cb_req_body(struct gwnet_http_req *req,
+					 struct gwbuf *b)
+{
+	struct gwbuf *bb = &req->body_buf;
+	size_t to_advance, to_copy;
+	int ret;
+
+	to_copy = to_advance = MIN_T(size_t, b->len, req->missing_body_len);
+
+	if (req->body_oversized)
+		goto out;
+
+	if (to_copy + bb->len > GWNET_HTTP_BODY_MAX_LEN) {
+		/*
+		 * This append would make the body oversized,
+		 * so we just copy the maximum amount of data
+		 * that would fit and mark the request as oversized.
+		 */
+		req->body_oversized = true;
+		to_copy = GWNET_HTTP_BODY_MAX_LEN - bb->len;
+	}
+
+	if (to_copy > 0) {
+		ret = gwbuf_append(bb, b->buf, to_copy);
+		if (ret < 0)
+			return ret;
+	}
+
+out:
+	req->missing_body_len -= to_advance;
+	gwbuf_advance(b, to_advance);
+	return req->missing_body_len > 0 ? -EAGAIN : 0;
+}
+
+static int gwnet_http_recv_cb_req_body_chunked_data(struct gwnet_http_req *req,
+						    struct gwbuf *b)
+{
+	int ret;
+
+	ret = __gwnet_http_recv_cb_req_body(req, b);
+	if (ret < 0)
+		return ret;
+
+	if (req->missing_body_len == 0)
+		req->chunk_state = GWNET_HTTP_CHUNK_ST_TRAILER;
+
+	return 0;
+}
+
+static int gwnet_http_recv_cb_req_body_chunked_tr(struct gwnet_http_req *req,
+						  struct gwbuf *b)
+{
+	size_t cmp_len;
+
+	assert(req->missing_body_len == 0);
+	if (b->len == 0)
+		return -EAGAIN;
+	cmp_len = b->len < 2 ? b->len : 2;
+	if (memcmp(b->buf, "\r\n", cmp_len) != 0)
+		return -EINVAL;
+	if (b->len < 2)
+		return -EAGAIN;
+
+	gwbuf_advance(b, 2);
+	if (req->chunk_state != GWNET_HTTP_CHUNK_ST_END)
+		req->chunk_state = GWNET_HTTP_CHUNK_ST_LEN;
+
+	return 0;
+}
+
+static int gwnet_http_recv_cb_req_body_chunked(struct gwnet_http_cli *hc,
+					       struct gwbuf *b)
+{
+	struct gwnet_http_req *req = hc->req_tail;
+	int ret = 0;
+
+	while (1) {
+		if (ret)
+			break;
+		if (!b->len) {
+			ret = -EAGAIN;
+			break;
+		}
+		if (hc->state != GWNET_HTTP_CLI_ST_REQ_BODY)
+			break;
+
+		switch (req->chunk_state) {
+		case GWNET_HTTP_CHUNK_ST_LEN:
+			ret = gwnet_http_recv_cb_req_body_chunked_len(req, b);
+			break;
+		case GWNET_HTTP_CHUNK_ST_DATA:
+			ret = gwnet_http_recv_cb_req_body_chunked_data(req, b);
+			break;
+		case GWNET_HTTP_CHUNK_ST_TRAILER:
+			ret = gwnet_http_recv_cb_req_body_chunked_tr(req, b);
+			break;
+		case GWNET_HTTP_CHUNK_ST_END:
+			ret = gwnet_http_recv_cb_req_body_chunked_tr(req, b);
+			if (!ret)
+				hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
+			goto out;
+		default:
+			ret = -EINVAL;
+			break;
+		}
+	}
+
+out:
+	return ret;
+}
+
 static int gwnet_http_recv_cb_req_body(struct gwnet_http_cli *hc,
 				       struct gwbuf *b)
 {
 	struct gwnet_http_req *req = hc->req_tail;
-	size_t append_len;
 	int ret;
 
-	if (req->body_len == GWNET_HTTP_BODY_LEN_CHUNKED) {
-		/*
-		 * TODO(ammarfaizi2): Handle chunked transfer encoding.
-		 * For now, we just ignore it.
-		 */
-		return -EINVAL;
-	}
+	if (req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE)
+		return gwnet_http_recv_cb_req_body_chunked(hc, b);
 
-	append_len = req->body_len < b->len ? req->body_len : b->len;
-	ret = gwbuf_append(&req->body_buf, b->buf, append_len);
+	ret = __gwnet_http_recv_cb_req_body(hc->req_tail, b);
 	if (ret < 0)
 		return ret;
 
-	gwbuf_advance(b, append_len);
-	if (req->body_buf.len < req->body_len)
-		return -EAGAIN;
+	if (req->missing_body_len == 0)
+		hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
 
-	hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
 	return 0;
 }
 
