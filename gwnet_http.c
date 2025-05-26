@@ -22,6 +22,8 @@
 struct gwnet_http_srv {
 	gwnet_tcp_srv_t			*tcp;
 	struct gwnet_http_srv_cfg	cfg;
+	void				*data_cb;
+	gwnet_http_srv_route_cb_t	route_cb;
 };
 
 enum {
@@ -85,7 +87,6 @@ struct gwnet_http_cli {
 	bool				keep_alive;
 	struct gwnet_http_srv		*srv;
 	struct gwnet_http_req		req;
-	gwnet_http_srv_route_cb_t	route_cb;
 };
 
 static void gwnet_http_hdr_free(struct gwnet_http_hdr *hdr)
@@ -665,8 +666,8 @@ static int gwnet_http_process_request(struct gwnet_http_cli *hc)
 {
 	int ret;
 
-	if (hc->route_cb)
-		ret = hc->route_cb(hc->srv, hc, &hc->req);
+	if (hc->srv->route_cb)
+		ret = hc->srv->route_cb(hc->srv, hc, &hc->req);
 	else
 		ret = gwnet_http_res_hello_world(hc);
 
@@ -930,4 +931,11 @@ void gwnet_http_srv_free(struct gwnet_http_srv *s)
 		memset(s, 0, sizeof(*s));
 		free(s);
 	}
+}
+
+void gwnet_http_srv_set_route_cb(gwnet_http_srv_t *s,
+				 gwnet_http_srv_route_cb_t cb, void *data)
+{
+	s->data_cb = data;
+	s->route_cb = cb;
 }

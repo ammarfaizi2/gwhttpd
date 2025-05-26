@@ -47,5 +47,7 @@ int gwnet_http_hdr_add(struct gwnet_http_hdr *hdr, const char *key,
 gwnet_http_srv_t *gwnet_http_srv_init(const struct gwnet_http_srv_cfg *cfg);
 int gwnet_http_srv_run(gwnet_http_srv_t *s);
 void gwnet_http_srv_free(struct gwnet_http_srv *s);
+void gwnet_http_srv_set_route_cb(gwnet_http_srv_t *s,
+				 gwnet_http_srv_route_cb_t cb, void *data);
 
 #endif /* #ifndef GWNET_HTTP_H */
