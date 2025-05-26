@@ -70,8 +70,6 @@ struct gwnet_http_res {
 	char			content_type[64];
 };
 
-#define GWNET_HTTP_BODY_LEN_CHUNKED	((uint64_t)-1)
-
 struct gwnet_http_req {
 	uint8_t			method;
 	uint8_t			version;
