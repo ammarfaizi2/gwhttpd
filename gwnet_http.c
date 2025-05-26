@@ -19,9 +19,6 @@
 	((___a < ___b) ? ___a : ___b);	\
 })
 
-#define GWNET_HTTP_HEADER_MAX_LEN	8192
-#define GWNET_HTTP_BODY_MAX_LEN		(1024 * 1024 * 10) // 10 MB
-
 struct gwnet_http_srv {
 	gwnet_tcp_srv_t			*tcp;
 	struct gwnet_http_srv_cfg	cfg;
@@ -171,7 +168,7 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 {
 	char *qs, *uri, *x, *ver, *end, *line, *next;
 	struct gwnet_http_req *req = &hc->req;
-	size_t len = b->len;
+	size_t len = b->len, max;
 
 	/*
 	 * b->buf is always null-terminated, so we can safely
@@ -214,13 +211,22 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 	if (len < 18)
 		return -EAGAIN;
 
+	max = hc->srv->cfg.max_req_hdr_len;
+
 	/*
 	 * Find the end of header, double CRLF.
 	 */
 	end = strstr(b->buf, "\r\n\r\n");
 	if (!end)
-		return (len > GWNET_HTTP_HEADER_MAX_LEN) ? -EINVAL : -EAGAIN;
+		return (len > max) ? -EINVAL : -EAGAIN;
 	end += 4;
+
+	if ((size_t)(end - b->buf) > max) {
+		/*
+		 * The header is too long.
+		 */
+		return -EINVAL;
+	}
 
 	/*
 	 * The request URI must start with a slash.
@@ -347,8 +353,10 @@ static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
 
 	if (req->missing_body_len || req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE) {
 		size_t alloc = req->missing_body_len;
-		if (alloc > GWNET_HTTP_BODY_MAX_LEN)
-			alloc = GWNET_HTTP_BODY_MAX_LEN;
+		size_t max = hc->srv->cfg.max_req_body_len;
+
+		if (alloc > max)
+			alloc = max;
 		if (gwbuf_init(&req->body_buf, alloc) < 0)
 			return -ENOMEM;
 		hc->state = GWNET_HTTP_CLI_ST_REQ_BODY;
@@ -435,11 +443,12 @@ static int gwnet_http_recv_cb_req_body_chunked_len(struct gwnet_http_req *req,
 	return 0;
 }
 
-static int __gwnet_http_recv_cb_req_body(struct gwnet_http_req *req,
+static int __gwnet_http_recv_cb_req_body(struct gwnet_http_cli *hc,
+					 struct gwnet_http_req *req,
 					 struct gwbuf *b)
 {
 	struct gwbuf *bb = &req->body_buf;
-	size_t to_advance, to_copy;
+	size_t to_advance, to_copy, max;
 	int ret;
 
 	to_copy = to_advance = MIN_T(size_t, b->len, req->missing_body_len);
@@ -447,14 +456,15 @@ static int __gwnet_http_recv_cb_req_body(struct gwnet_http_req *req,
 	if (req->body_oversized)
 		goto out;
 
-	if (to_copy + bb->len > GWNET_HTTP_BODY_MAX_LEN) {
+	max = hc->srv->cfg.max_req_body_len;
+	if (to_copy + bb->len > max) {
 		/*
 		 * This append would make the body oversized,
 		 * so we just copy the maximum amount of data
 		 * that would fit and mark the request as oversized.
 		 */
 		req->body_oversized = true;
-		to_copy = GWNET_HTTP_BODY_MAX_LEN - bb->len;
+		to_copy = max - bb->len;
 	}
 
 	if (to_copy > 0) {
@@ -469,12 +479,13 @@ out:
 	return req->missing_body_len > 0 ? -EAGAIN : 0;
 }
 
-static int gwnet_http_recv_cb_req_body_chunked_data(struct gwnet_http_req *req,
+static int gwnet_http_recv_cb_req_body_chunked_data(struct gwnet_http_cli *hc,
+						    struct gwnet_http_req *req,
 						    struct gwbuf *b)
 {
 	int ret;
 
-	ret = __gwnet_http_recv_cb_req_body(req, b);
+	ret = __gwnet_http_recv_cb_req_body(hc, req, b);
 	if (ret < 0)
 		return ret;
 
@@ -526,7 +537,7 @@ static int gwnet_http_recv_cb_req_body_chunked(struct gwnet_http_cli *hc,
 			ret = gwnet_http_recv_cb_req_body_chunked_len(req, b);
 			break;
 		case GWNET_HTTP_CHUNK_ST_DATA:
-			ret = gwnet_http_recv_cb_req_body_chunked_data(req, b);
+			ret = gwnet_http_recv_cb_req_body_chunked_data(hc, req, b);
 			break;
 		case GWNET_HTTP_CHUNK_ST_TRAILER:
 			ret = gwnet_http_recv_cb_req_body_chunked_tr(req, b);
@@ -555,7 +566,7 @@ static int gwnet_http_recv_cb_req_body(struct gwnet_http_cli *hc,
 	if (req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE)
 		return gwnet_http_recv_cb_req_body_chunked(hc, b);
 
-	ret = __gwnet_http_recv_cb_req_body(req, b);
+	ret = __gwnet_http_recv_cb_req_body(hc, req, b);
 	if (ret < 0)
 		return ret;
 
@@ -873,10 +884,10 @@ static int gwnet_http_accept_cb(void *data, struct gwnet_tcp_srv *s,
 static int gwnet_http_srv_validate_cfg(struct gwnet_http_srv_cfg *cfg)
 {
 	if (!cfg->max_req_hdr_len)
-		cfg->max_req_hdr_len = GWNET_HTTP_HEADER_MAX_LEN;
+		cfg->max_req_hdr_len = GWNET_HTTP_DEF_MAX_REQ_HDR_LEN;
 
 	if (!cfg->max_req_body_len)
-		cfg->max_req_body_len = GWNET_HTTP_BODY_MAX_LEN;
+		cfg->max_req_body_len = GWNET_HTTP_DEF_MAX_REQ_BODY_LEN;
 
 	return 0;
 }
