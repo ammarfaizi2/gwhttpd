@@ -1,4 +1,9 @@
-
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * gwnet_http.c
+ *
+ * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
+ */
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -7,879 +12,345 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <assert.h>
+#include <ctype.h>
+#include <time.h>
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "gwnet_http.h"
 #include "gwnet_tcp.h"
 #include "gwbuf.h"
 
-#define MIN_T(TYPE, A, B)		\
-({					\
-	TYPE ___a = (A);		\
-	TYPE ___b = (B);		\
-	((___a < ___b) ? ___a : ___b);	\
-})
+#include "common.h"
+
+#define GWNET_HTTP_SEND_BUF		4096
+
+enum {
+	GWNET_HTTP_TX_ST_INIT		= 0,
+	GWNET_HTTP_TX_ST_HDR		= 1,
+	GWNET_HTTP_TX_ST_BODY		= 2,
+	GWNET_HTTP_TX_ST_DONE		= 3,
+	GWNET_HTTP_TX_ST_ERROR		= 4,
+};
+
+enum {
+	GWNET_HTTP_RX_ST_INIT		= 0,
+	GWNET_HTTP_RX_ST_HDR		= 1,
+	GWNET_HTTP_RX_ST_BODY		= 2,
+	GWNET_HTTP_RX_ST_DONE		= 3,
+	GWNET_HTTP_RX_ST_ERROR		= 4,
+};
+
+struct gwnet_http_res_body_zero {
+	uint64_t	zero_len;
+	uint64_t	zero_off;
+};
+
+struct gwnet_http_res_body_urandom {
+	uint64_t	ur_len;
+	uint64_t	ur_off;
+};
+
+struct gwnet_http_res_body_file {
+	int		fd;
+	uint64_t	file_len;
+	uint64_t	file_off;
+};
+
+struct gwnet_http_res_body_buf {
+	struct gwbuf	buf;
+};
+
+struct gwnet_http_res_body {
+	uint8_t	type;
+	union {
+		struct gwnet_http_res_body_zero		zero;
+		struct gwnet_http_res_body_urandom	urandom;
+		struct gwnet_http_res_body_file		file;
+		struct gwnet_http_res_body_buf		buf;
+	};
+};
+
+struct gwnet_http_res {
+	uint16_t			status;
+	uint8_t				version;
+	struct gwnet_http_hdr_fields	hdr;
+	uint64_t			content_length;
+	char				content_type[128];
+	struct gwnet_http_res_body	body;
+};
+
+struct gwnet_http_req {
+	struct gwnet_http_req		*next;
+	bool				is_chunked;
+	bool				is_body_oversized;
+	bool				keep_alive;
+	union {
+		struct gwnet_http_hdr_pctx	hpctx;
+		struct gwnet_http_body_pctx	bpctx;
+	};
+	struct gwnet_http_req_hdr	hdr;
+	struct gwbuf			body_buf;
+	uint64_t			con_len;
+	uint64_t			rcon_len;
+	char				*content_type;
+	char				*uri;
+	char				*qs;
+	struct gwnet_http_res		res;
+};
+
+struct gwnet_http_cli {
+	uint8_t				tx_state;
+	uint8_t				rx_state;
+	bool				stop_receiving;
+	struct gwnet_http_srv		*srv;
+	struct gwnet_http_req		*req_head;
+	struct gwnet_http_req		*req_tail;
+	void				*data_cb;
+	gwnet_http_srv_rt_cb_t		rt_cb;
+	gwnet_http_srv_rt_on_hdr_cb_t	rt_on_hdr_cb;
+	gwnet_http_srv_rt_on_body_cb_t	rt_on_body_cb;
+};
 
 struct gwnet_http_srv {
 	gwnet_tcp_srv_t			*tcp;
 	struct gwnet_http_srv_cfg	cfg;
 	void				*data_cb;
-	gwnet_http_srv_route_cb_t	route_cb;
+	gwnet_http_srv_accept_cb_t	accept_cb;
 };
 
-enum {
-	GWNET_HTTP_CLI_ST_INIT		= 0,
-	GWNET_HTTP_CLI_ST_REQ_HEADER	= 1,
-	GWNET_HTTP_CLI_ST_REQ_BODY	= 2,
-	GWNET_HTTP_CLI_ST_REQ_OK	= 3,
-	GWNET_HTTP_CLI_ST_RES_HEADER	= 4,
-	GWNET_HTTP_CLI_ST_RES_BODY	= 5,
-	GWNET_HTTP_CLI_ST_RES_OK	= 6,
-};
-
-enum {
-	GWNET_HTTP_VER_1_0	= 0,
-	GWNET_HTTP_VER_1_1	= 1,
-};
-
-enum {
-	GWNET_HTTP_METHOD_GET		= 0,
-	GWNET_HTTP_METHOD_POST		= 1,
-	GWNET_HTTP_METHOD_PUT		= 2,
-	GWNET_HTTP_METHOD_DELETE	= 3,
-	GWNET_HTTP_METHOD_HEAD		= 4,
-	GWNET_HTTP_METHOD_OPTIONS	= 5,
-	GWNET_HTTP_METHOD_PATCH		= 6,
-	GWNET_HTTP_METHOD_TRACE		= 7,
-	GWNET_HTTP_METHOD_CONNECT	= 8,
-	GWNET_HTTP_METHOD_UNKNOWN	= 100,
-};
-
-enum {
-	GWNET_HTTP_CHUNK_ST_NONE	= 0,
-	GWNET_HTTP_CHUNK_ST_LEN		= 1,
-	GWNET_HTTP_CHUNK_ST_DATA	= 2,
-	GWNET_HTTP_CHUNK_ST_TRAILER	= 3,
-	GWNET_HTTP_CHUNK_ST_END		= 4,
-};
-
-struct gwnet_http_res {
-	int			code;
-	struct gwnet_http_hdr	hdr;
-	struct gwbuf		body_buf;
-	char			content_type[64];
-};
-
-struct gwnet_http_req {
-	uint8_t			method;
-	uint8_t			version;
-	uint8_t			chunk_state;
-	bool			body_oversized;
-	uint64_t		missing_body_len;
-	struct gwbuf		body_buf;
-	struct gwnet_http_hdr	hdr;
-	struct gwnet_http_res	res;
-	char			*uri;
-	char			*qs;
-};
-
-struct gwnet_http_cli {
-	uint8_t				state;
-	bool				keep_alive;
-	struct gwnet_http_srv		*srv;
-	struct gwnet_http_req		req;
-};
-
-static void gwnet_http_hdr_free(struct gwnet_http_hdr *hdr)
-{
-	size_t i;
-
-	if (!hdr || !hdr->pairs)
-		return;
-
-	for (i = 0; i < hdr->nr_pairs; i++) {
-		free(hdr->pairs[i].key);
-		free(hdr->pairs[i].val);
-	}
-
-	free(hdr->pairs);
-	hdr->pairs = NULL;
-	hdr->nr_pairs = 0;
-}
-
-static int gwnet_http_hdr_find_idx(struct gwnet_http_hdr *hdr,
-				   const char *key)
-{
-	size_t i;
-
-	for (i = 0; i < hdr->nr_pairs; i++) {
-		if (!strcmp(hdr->pairs[i].key, key))
-			return i;
-	}
-
-	return -ENOENT;
-}
-
-static void gwnet_http_req_free(struct gwnet_http_req *req)
-{
-	gwnet_http_hdr_free(&req->hdr);
-	gwnet_http_hdr_free(&req->res.hdr);
-	gwbuf_free(&req->body_buf);
-	free(req->uri);
-	free(req->qs);
-	memset(req, 0, sizeof(*req));
-}
-
-static struct gwnet_http_cli *gwnet_http_cli_alloc(struct gwnet_http_srv *srv)
-{
-	struct gwnet_http_cli *hc = calloc(1, sizeof(*hc));
-	if (!hc)
-		return NULL;
-
-	hc->state = GWNET_HTTP_CLI_ST_INIT;
-	hc->srv = srv;
-	return hc;
-}
-
-static void gwnet_http_cli_free(struct gwnet_http_cli *hc)
-{
-	if (hc) {
-		gwnet_http_req_free(&hc->req);
-		free(hc);
-	}
-}
-
-static int gwnet_http_recv_cb_init(struct gwnet_http_cli *hc)
-{
-	hc->state = GWNET_HTTP_CLI_ST_REQ_HEADER;
-	return 0;
-}
-
-static void c_strtolower(char *str)
-{
-	char *p = str;
-	while (*p) {
-		if (*p >= 'A' && *p <= 'Z')
-			*p += ('a' - 'A');
-		p++;
-	}
-}
-
-static int gwnet_http_recv_cb_req_header(struct gwnet_http_cli *hc,
-					 struct gwbuf *b)
-{
-	char *qs, *uri, *x, *ver, *end, *line, *next;
-	struct gwnet_http_req *req = &hc->req;
-	size_t len = b->len, max;
-
-	/*
-	 * b->buf is always null-terminated, so we can safely
-	 * strncmp() it.
-	 */
-	#define IF_HDR_CMP_METHOD(METHOD, RET) \
-	if (!strncmp(b->buf, #METHOD " ", len > (sizeof(#METHOD) - 1) ? \
-			(sizeof(#METHOD) - 1) : len)) { \
-		uri = b->buf + (sizeof(#METHOD) - 1) + 1; \
-		req->method = GWNET_HTTP_METHOD_##METHOD; \
-		if (RET) \
-			return RET; \
-	}
-
-	/*
-	 * TODO(amamrfaizi2): Add more HTTP method supports.
-	 */
-	IF_HDR_CMP_METHOD(GET, 0) else
-	IF_HDR_CMP_METHOD(POST, 0) else
-	IF_HDR_CMP_METHOD(PUT, -EINVAL) else
-	IF_HDR_CMP_METHOD(DELETE, -EINVAL) else
-	IF_HDR_CMP_METHOD(HEAD, -EINVAL) else
-	IF_HDR_CMP_METHOD(OPTIONS, -EINVAL) else
-	IF_HDR_CMP_METHOD(PATCH, -EINVAL) else
-	IF_HDR_CMP_METHOD(TRACE, -EINVAL) else
-	IF_HDR_CMP_METHOD(CONNECT, -EINVAL) else {
-		req->method = GWNET_HTTP_METHOD_UNKNOWN;
-		return -EINVAL;
-	}
-
-	#undef IF_HDR_CMP_METHOD
-
-	/*
-	 * Shortest possible HTTP header.
-	 *
-	 *    "GET / HTTP/1.0\r\n\r\n"
-	 *
-	 * It is 18 characters long.
-	 */
-	if (len < 18)
-		return -EAGAIN;
-
-	max = hc->srv->cfg.max_req_hdr_len;
-
-	/*
-	 * Find the end of header, double CRLF.
-	 */
-	end = strstr(b->buf, "\r\n\r\n");
-	if (!end)
-		return (len > max) ? -EINVAL : -EAGAIN;
-	end += 4;
-
-	if ((size_t)(end - b->buf) > max) {
-		/*
-		 * The header is too long.
-		 */
-		return -EINVAL;
-	}
-
-	/*
-	 * The request URI must start with a slash.
-	 */
-	if (*uri != '/')
-		return -EINVAL;
-
-	/*
-	 * Find the space between the URI and the HTTP version.
-	 */
-	x = strchr(uri, ' ');
-	if (!x)
-		return -EINVAL;
-	*x = '\0';
-
-	/*
-	 * The URI is now a null-terminated string, now split the path
-	 * and the query string.
-	 *
-	 * `qs` will point to the query string if it exists,
-	 * otherwise it will be NULL.
-	 */
-	qs = strchr(uri, '?');
-	if (qs) {
-		*qs = '\0';
-		qs++;
-	}
-
-	/*
-	 * Parse the HTTP version.
-	 */
-	ver = x + 1;
-	if (!strncmp(ver, "HTTP/", 5)) {
-		if (!strncmp(ver + 5, "1.0", 3)) {
-			req->version = GWNET_HTTP_VER_1_0;
-			hc->keep_alive = false;
-		} else if (!strncmp(ver + 5, "1.1", 3)) {
-			req->version = GWNET_HTTP_VER_1_1;
-			hc->keep_alive = true;
-		} else {
-			return -EINVAL;
-		}
-	} else {
-		return -EINVAL;
-	}
-
-	/*
-	 * Prepare a pointer to the second line of the HTTP header.
-	 */
-	line = ver + 8;	/* Skip "HTTP/1.x" */
-	if (strncmp(line, "\r\n", 2))
-		return -EINVAL;
-	line += 2;
-	/*
-	 * Now we have the method, URI, query string and version.
-	 */
-	req->uri = strdup(uri);
-	req->qs = qs ? strdup(qs) : NULL;
-	if (!req->uri || (qs && !req->qs)) {
-		free(req->uri);
-		free(req->qs);
-		return -ENOMEM;
-	}
-
-	/*
-	 * Parse HTTP header key-val pairs.
-	 */
-	while (1) {
-		char *k, *v;
-		int ret;
-
-		next = strstr(line, "\r\n");
-		if (!next)
-			return -EINVAL;
-		if (next >= end)
-			return -EINVAL;
-
-		*next = '\0';
-		k = line;
-		v = strchr(k, ':');
-		if (!v || v == k)
-			return -EINVAL;
-
-		*v = '\0';
-		v++;
-
-		/*
-		 * Skip leading spaces.
-		 */
-		while (*v == ' ')
-			v++;
-
-		c_strtolower(k);
-		if (!strcmp(k, "connection")) {
-			c_strtolower(v);
-			if (strstr(v, "keep-alive"))
-				hc->keep_alive = true;
-			else if (strstr(v, "close"))
-				hc->keep_alive = false;
-			else
-				return -EINVAL;
-		} else if (!strcmp(k, "content-length")) {
-			char *ep;
-			req->missing_body_len = strtoull(v, &ep, 10);
-			if (*ep != '\0')
-				return -EINVAL;
-		} else if (!strcmp(k, "transfer-encoding")) {
-			if (strstr(v, "chunked")) {
-				req->missing_body_len = 0;
-				req->chunk_state = GWNET_HTTP_CHUNK_ST_LEN;
-			} else {
-				return -EINVAL;
-			}
-		}
-
-		ret = gwnet_http_hdr_add(&req->hdr, k, v);
-		if (ret < 0)
-			return ret;
-
-		line = next + 2;
-		if (!strncmp(line, "\r\n", 2))
-			break;
-	}
-
-	if (req->missing_body_len || req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE) {
-		size_t alloc = req->missing_body_len;
-		size_t max = hc->srv->cfg.max_req_body_len;
-
-		if (alloc > max)
-			alloc = max;
-		if (gwbuf_init(&req->body_buf, alloc) < 0)
-			return -ENOMEM;
-		hc->state = GWNET_HTTP_CLI_ST_REQ_BODY;
-	} else {
-		hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
-	}
-
-	gwbuf_advance(b, end - b->buf);
-	return 0;
-}
-
-static bool str_is_hexdigit(const char *x)
-{
-	while (1) {
-		char c = *x;
-		if (!c)
-			break;
-
-		if (!((c >= '0' && c <= '9') ||
-		      (c >= 'a' && c <= 'f') ||
-		      (c >= 'A' && c <= 'F')))
-			return false;
-
-		x++;
-	}
-	return true;
-}
-
-static int gwnet_http_recv_cb_req_body_chunked_len(struct gwnet_http_req *req,
-						   struct gwbuf *b)
-{
-	char *cr, *endp;
-
-	assert(req->missing_body_len == 0);
-
-	/*
-	 * Shortest chunk size is 1 hex digit plus CRLF (3 bytes).
-	 */
-	if (b->len < 3)
-		return -EAGAIN;
-
-	/*
-	 * Look for CR marking end of hex length field.
-	 */
-	cr = memchr(b->buf, '\r', b->len);
-	if (!cr) {
-		/*
-		 * Too many hex digits or invalid character?
-		 */
-		if (b->len > 16 || !str_is_hexdigit(b->buf))
-			return -EINVAL;
-
-		/*
-		 * Still waiting for CRLF.
-		 */
-		return -EAGAIN;
-	}
-
-	/*
-	 * Ensure LF follows CR and is within buffer.
-	 */
-	if ((size_t)(cr - b->buf) + 2 > b->len)
-		return -EAGAIN;
-	if (cr[1] != '\n')
-		return -EINVAL;
-
-	/*
-	 * Null-terminate the length string and parse.
-	 */
-	*cr = '\0';
-	req->missing_body_len = strtoull(b->buf, &endp, 16);
-	if (*endp != '\0')
-		return -EINVAL;
-
-	req->chunk_state =
-		req->missing_body_len == 0 ?
-			GWNET_HTTP_CHUNK_ST_END :
-			GWNET_HTTP_CHUNK_ST_DATA;
-
-	/*
-	 * Consume the length line and CRLF.
-	 */
-	gwbuf_advance(b, (cr - b->buf) + 2);
-	return 0;
-}
-
-static int __gwnet_http_recv_cb_req_body(struct gwnet_http_cli *hc,
-					 struct gwnet_http_req *req,
-					 struct gwbuf *b)
-{
-	struct gwbuf *bb = &req->body_buf;
-	size_t to_advance, to_copy, max;
-	int ret;
-
-	to_copy = to_advance = MIN_T(size_t, b->len, req->missing_body_len);
-
-	if (req->body_oversized)
-		goto out;
-
-	max = hc->srv->cfg.max_req_body_len;
-	if (to_copy + bb->len > max) {
-		/*
-		 * This append would make the body oversized,
-		 * so we just copy the maximum amount of data
-		 * that would fit and mark the request as oversized.
-		 */
-		req->body_oversized = true;
-		to_copy = max - bb->len;
-	}
-
-	if (to_copy > 0) {
-		ret = gwbuf_append(bb, b->buf, to_copy);
-		if (ret < 0)
-			return ret;
-	}
-
-out:
-	req->missing_body_len -= to_advance;
-	gwbuf_advance(b, to_advance);
-	return req->missing_body_len > 0 ? -EAGAIN : 0;
-}
-
-static int gwnet_http_recv_cb_req_body_chunked_data(struct gwnet_http_cli *hc,
-						    struct gwnet_http_req *req,
-						    struct gwbuf *b)
-{
-	int ret;
-
-	ret = __gwnet_http_recv_cb_req_body(hc, req, b);
-	if (ret < 0)
-		return ret;
-
-	if (req->missing_body_len == 0)
-		req->chunk_state = GWNET_HTTP_CHUNK_ST_TRAILER;
-
-	return 0;
-}
-
-static int gwnet_http_recv_cb_req_body_chunked_tr(struct gwnet_http_req *req,
-						  struct gwbuf *b)
-{
-	size_t cmp_len;
-
-	assert(req->missing_body_len == 0);
-	if (b->len == 0)
-		return -EAGAIN;
-	cmp_len = b->len < 2 ? b->len : 2;
-	if (memcmp(b->buf, "\r\n", cmp_len) != 0)
-		return -EINVAL;
-	if (b->len < 2)
-		return -EAGAIN;
-
-	gwbuf_advance(b, 2);
-	if (req->chunk_state != GWNET_HTTP_CHUNK_ST_END)
-		req->chunk_state = GWNET_HTTP_CHUNK_ST_LEN;
-
-	return 0;
-}
-
-static int gwnet_http_recv_cb_req_body_chunked(struct gwnet_http_cli *hc,
-					       struct gwbuf *b)
-{
-	struct gwnet_http_req *req = &hc->req;
-	int ret = 0;
-
-	while (1) {
-		if (ret)
-			break;
-		if (!b->len) {
-			ret = -EAGAIN;
-			break;
-		}
-		if (hc->state != GWNET_HTTP_CLI_ST_REQ_BODY)
-			break;
-
-		switch (req->chunk_state) {
-		case GWNET_HTTP_CHUNK_ST_LEN:
-			ret = gwnet_http_recv_cb_req_body_chunked_len(req, b);
-			break;
-		case GWNET_HTTP_CHUNK_ST_DATA:
-			ret = gwnet_http_recv_cb_req_body_chunked_data(hc, req, b);
-			break;
-		case GWNET_HTTP_CHUNK_ST_TRAILER:
-			ret = gwnet_http_recv_cb_req_body_chunked_tr(req, b);
-			break;
-		case GWNET_HTTP_CHUNK_ST_END:
-			ret = gwnet_http_recv_cb_req_body_chunked_tr(req, b);
-			if (!ret)
-				hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
-			goto out;
-		default:
-			ret = -EINVAL;
-			break;
-		}
-	}
-
-out:
-	return ret;
-}
-
-static int gwnet_http_recv_cb_req_body(struct gwnet_http_cli *hc,
-				       struct gwbuf *b)
-{
-	struct gwnet_http_req *req = &hc->req;
-	int ret;
-
-	if (req->chunk_state != GWNET_HTTP_CHUNK_ST_NONE)
-		return gwnet_http_recv_cb_req_body_chunked(hc, b);
-
-	ret = __gwnet_http_recv_cb_req_body(hc, req, b);
-	if (ret < 0)
-		return ret;
-
-	if (req->missing_body_len == 0)
-		hc->state = GWNET_HTTP_CLI_ST_REQ_OK;
-
-	return 0;
-}
-
-static const char *translate_http_code(int code)
+static const char *translate_http_code(uint16_t code)
 {
 	switch (code) {
 	case 100: return "Continue";
 	case 101: return "Switching Protocols";
+	case 102: return "Processing";
+	case 103: return "Early Hints";
 	case 200: return "OK";
 	case 201: return "Created";
 	case 202: return "Accepted";
+	case 203: return "Non-Authoritative Information";
 	case 204: return "No Content";
+	case 205: return "Reset Content";
+	case 206: return "Partial Content";
+	case 207: return "Multi-Status";
+	case 208: return "Already Reported";
+	case 226: return "IM Used";
+	case 300: return "Multiple Choices";
 	case 301: return "Moved Permanently";
 	case 302: return "Found";
 	case 303: return "See Other";
 	case 304: return "Not Modified";
+	case 305: return "Use Proxy";
 	case 307: return "Temporary Redirect";
 	case 308: return "Permanent Redirect";
 	case 400: return "Bad Request";
 	case 401: return "Unauthorized";
+	case 402: return "Payment Required";
 	case 403: return "Forbidden";
 	case 404: return "Not Found";
 	case 405: return "Method Not Allowed";
+	case 406: return "Not Acceptable";
+	case 407: return "Proxy Authentication Required";
+	case 408: return "Request Timeout";
+	case 409: return "Conflict";
+	case 410: return "Gone";
+	case 411: return "Length Required";
+	case 412: return "Precondition Failed";
+	case 413: return "Payload Too Large";
+	case 414: return "URI Too Long";
+	case 415: return "Unsupported Media Type";
+	case 416: return "Range Not Satisfiable";
+	case 417: return "Expectation Failed";
 	case 418: return "I'm a teapot";
+	case 421: return "Misdirected Request";
+	case 422: return "Unprocessable Entity";
+	case 423: return "Locked";
+	case 424: return "Failed Dependency";
+	case 425: return "Too Early";
+	case 426: return "Upgrade Required";
+	case 428: return "Precondition Required";
 	case 429: return "Too Many Requests";
+	case 431: return "Request Header Fields Too Large";
+	case 451: return "Unavailable For Legal Reasons";
 	case 500: return "Internal Server Error";
 	case 501: return "Not Implemented";
 	case 502: return "Bad Gateway";
 	case 503: return "Service Unavailable";
 	case 504: return "Gateway Timeout";
 	case 505: return "HTTP Version Not Supported";
-	default:  return "Unknown";
+	case 506: return "Variant Also Negotiates";
+	case 507: return "Insufficient Storage";
+	case 508: return "Loop Detected";
+	case 510: return "Not Extended";
+	case 511: return "Network Authentication Required";
+	default: return "Unknown";
 	}
 }
 
-static int gwnet_http_handle_request(struct gwnet_http_cli *hc, struct gwbuf *b)
+void gwnet_http_srv_set_data_cb(gwnet_http_srv_t *srv, void *data)
 {
-	int ret;
+	srv->data_cb = data;
+}
 
-	while (1) {
-		if (b->len == 0) {
-			ret = -EAGAIN;
-			break;
+void gwnet_http_srv_set_accept_cb(gwnet_http_srv_t *srv,
+				  gwnet_http_srv_accept_cb_t cb)
+{
+	srv->accept_cb = cb;
+}
+
+void gwnet_http_cli_set_data_cb(gwnet_http_cli_t *hc, void *data)
+{
+	hc->data_cb = data;
+}
+
+void gwnet_http_cli_set_rt_cb(gwnet_http_cli_t *hc,
+			      gwnet_http_srv_rt_cb_t cb)
+{
+	hc->rt_cb = cb;
+}
+
+void gwnet_http_cli_set_rt_on_hdr_cb(gwnet_http_cli_t *hc,
+				     gwnet_http_srv_rt_on_hdr_cb_t cb)
+{
+	hc->rt_on_hdr_cb = cb;
+}
+
+void gwnet_http_cli_set_rt_on_body_cb(gwnet_http_cli_t *hc,
+				      gwnet_http_srv_rt_on_body_cb_t cb)
+{
+	hc->rt_on_body_cb = cb;
+}
+
+static inline uint64_t min_st(uint64_t a, uint64_t b)
+{
+	return (a < b) ? a : b;
+}
+
+struct gwnet_http_res *gwnet_http_req_get_res(gwnet_http_req_t *req)
+{
+	return &req->res;
+}
+
+void gwnet_http_res_set_code(gwnet_http_res_t *res, uint8_t code)
+{
+	res->status = code;
+}
+
+void gwnet_http_res_set_content_type(gwnet_http_res_t *res,
+				     const char *content_type)
+{
+	const size_t l = sizeof(res->content_type) - 1;
+	char *s = res->content_type;
+	strncpy(s, content_type, l);
+	s[l] = '\0';
+}
+
+static void gwnet_http_res_body_free(struct gwnet_http_res_body *b)
+{
+	switch (b->type) {
+	case GWNET_HTTP_RES_TYPE_NO_CONTENT:
+		break;
+	case GWNET_HTTP_RES_TYPE_BUF:
+		gwbuf_free(&b->buf.buf);
+		break;
+	case GWNET_HTTP_RES_TYPE_ZERO:
+		b->zero.zero_len = 0;
+		b->zero.zero_off = 0;
+		break;
+	case GWNET_HTTP_RES_TYPE_URANDOM:
+		b->urandom.ur_len = 0;
+		b->urandom.ur_off = 0;
+		break;
+	case GWNET_HTTP_RES_TYPE_FILE:
+		if (b->file.fd >= 0) {
+			__sys_close(b->file.fd);
+			b->file.fd = -1;
 		}
-
-		switch (hc->state) {
-		case GWNET_HTTP_CLI_ST_INIT:
-			ret = gwnet_http_recv_cb_init(hc);
-			break;
-		case GWNET_HTTP_CLI_ST_REQ_HEADER:
-			ret = gwnet_http_recv_cb_req_header(hc, b);
-			break;
-		case GWNET_HTTP_CLI_ST_REQ_BODY:
-			ret = gwnet_http_recv_cb_req_body(hc, b);
-			break;
-		case GWNET_HTTP_CLI_ST_REQ_OK:
-			return 0;
-		default:
-			ret = -EINVAL;
-			break;
-		}
-
-		if (ret)
-			break;
-
-		if (!ret && hc->state == GWNET_HTTP_CLI_ST_REQ_OK) {
-			ret = 0;
-			break;
-		}
+		b->file.file_len = 0;
+		b->file.file_off = 0;
+		break;
+	default:
+		assert(0 && "Unknown response body type");
+		break;
 	}
 
-	return ret;
+	memset(b, 0, sizeof(*b));
+	b->type = GWNET_HTTP_RES_TYPE_NO_CONTENT;
 }
 
-static int gwnet_http_res_hello_world(struct gwnet_http_cli *hc)
+void gwnet_http_res_body_set_zero(gwnet_http_res_t *res, uint64_t len)
 {
-	struct gwnet_http_req *req = &hc->req;
-	struct gwnet_http_res *res = &req->res;
-	int r = 0;
-
-	res->code = 200;
-	strncpy(res->content_type, "text/plain", sizeof(res->content_type) - 1);
-	res->content_type[sizeof(res->content_type) - 1] = '\0';
-	r = gwbuf_apfmt(&res->body_buf, "Hello world!\n");
-	hc->state = GWNET_HTTP_CLI_ST_RES_HEADER;
-	return r;
+	gwnet_http_res_body_free(&res->body);
+	res->body.type = GWNET_HTTP_RES_TYPE_ZERO;
+	res->body.zero.zero_len = len;
+	res->body.zero.zero_off = 0;
 }
 
-static int gwnet_http_process_request(struct gwnet_http_cli *hc)
+void gwnet_http_res_body_set_urandom(gwnet_http_res_t *res, uint64_t len)
 {
-	int ret;
-
-	if (hc->srv->route_cb)
-		ret = hc->srv->route_cb(hc->srv, hc, &hc->req);
-	else
-		ret = gwnet_http_res_hello_world(hc);
-
-	return ret;
+	gwnet_http_res_body_free(&res->body);
+	res->body.type = GWNET_HTTP_RES_TYPE_URANDOM;
+	res->body.urandom.ur_len = len;
+	res->body.urandom.ur_off = 0;
 }
 
-static void gwnet_http_res_free(struct gwnet_http_res *res)
+void gwnet_http_res_body_set_file(gwnet_http_res_t *res, int fd,
+				  uint64_t len)
 {
-	if (!res)
-		return;
-
-	gwnet_http_hdr_free(&res->hdr);
-	gwbuf_free(&res->body_buf);
-	memset(res, 0, sizeof(*res));
+	gwnet_http_res_body_free(&res->body);
+	res->body.type = GWNET_HTTP_RES_TYPE_FILE;
+	res->body.file.fd = fd;
+	res->body.file.file_len = len;
+	res->body.file.file_off = 0;
 }
 
-static int gwnet_http_construct_response(gwnet_tcp_cli_t *c,
-					 struct gwnet_http_cli *hc)
+int gwnet_http_res_body_set_file_path(gwnet_http_res_t *res,
+				      const char *path)
 {
-	const char *conn = hc->keep_alive ? "keep-alive" : "close";
-	struct gwbuf *t = gwnet_tcp_srv_cli_get_tx_buf(c);
-	struct gwnet_http_req *req = &hc->req;
-	struct gwnet_http_res *res = &req->res;
-	const char *code = translate_http_code(res->code);
-	int r = 0;
-	size_t i;
+	struct stat st;
+	int ret, fd;
 
-	r |= gwbuf_apfmt(t, "HTTP/1.%d %d %s\r\n", req->version, res->code, code);
-	r |= gwbuf_apfmt(t, "Server: gwhttpd2\r\n");
-	r |= gwbuf_apfmt(t, "Content-Type: %s\r\n", res->content_type);
-	r |= gwbuf_apfmt(t, "Content-Length: %zu\r\n", res->body_buf.len);
-	r |= gwbuf_apfmt(t, "Connection: %s\r\n", conn);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
 
-	for (i = 0; i < res->hdr.nr_pairs; i++) {
-		const char *k, *v;
-		k = res->hdr.pairs[i].key;
-		v = res->hdr.pairs[i].val;
-		r |= gwbuf_apfmt(t, "%s: %s\r\n", k, v);
+	if (fstat(fd, &st) < 0) {
+		ret = -errno;
+		close(fd);
+		return ret;
 	}
 
-	r |= gwbuf_append(t, "\r\n", 2);
-	r |= gwbuf_append(t, res->body_buf.buf, res->body_buf.len);
-
-	gwnet_http_res_free(res);
-	gwnet_http_req_free(req);
-	hc->state = GWNET_HTTP_CLI_ST_RES_OK;
-	return r;
-}
-
-static int gwnet_http_recv_cb(void *data, struct gwnet_tcp_srv *s,
-			      gwnet_tcp_cli_t *c, struct gwbuf *b)
-{
-	struct gwnet_http_cli *hc = data;
-	int ret = 0;
-
-	while (b->len > 0) {
-		ret = gwnet_http_handle_request(hc, b);
-		if (ret)
-			break;
-
-		ret = gwnet_http_process_request(hc);
-		if (ret)
-			break;
-
-		ret = gwnet_http_construct_response(c, hc);
-		if (ret)
-			break;
-
-		if (hc->state == GWNET_HTTP_CLI_ST_RES_OK)
-			hc->state = GWNET_HTTP_CLI_ST_INIT;
+	if (!S_ISREG(st.st_mode)) {
+		close(fd);
+		return -EINVAL;
 	}
 
-	if (ret == -EAGAIN)
-		ret = 0;
-
-	(void)s;
-	return ret;
+	gwnet_http_res_body_set_file(res, fd, st.st_size);
+	return 0;
 }
 
-const char *gwnet_http_hdr_get_val(struct gwnet_http_hdr *hdr, const char *key)
+void gwnet_http_res_body_set_buf(gwnet_http_res_t *res, struct gwbuf *buf)
 {
-	int i = gwnet_http_hdr_find_idx(hdr, key);
-	if (i < 0)
+	gwnet_http_res_body_free(&res->body);
+	res->body.type = GWNET_HTTP_RES_TYPE_BUF;
+	gwbuf_move(&res->body.buf.buf, buf);
+}
+
+struct gwbuf *gwnet_http_res_body_get_buf(gwnet_http_res_t *res)
+{
+	if (res->body.type != GWNET_HTTP_RES_TYPE_BUF)
 		return NULL;
 
-	return hdr->pairs[i].val;
+	return &res->body.buf.buf;
 }
 
-int gwnet_http_hdr_addf(struct gwnet_http_hdr *hdr, const char *key,
-		        const char *fmt, ...)
+struct gwnet_http_hdr_fields *gwnet_http_res_get_hdr_fields(
+						gwnet_http_res_t *res)
 {
-	va_list a1, a2;
-	char *v;
-	int ret;
-
-	va_start(a1, fmt);
-	va_copy(a2, a1);
-	ret = vsnprintf(NULL, 0, fmt, a1);
-	va_end(a1);
-
-	v = malloc(ret + 1);
-	if (!v) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	vsnprintf(v, ret + 1, fmt, a2);
-	ret = gwnet_http_hdr_add(hdr, key, v);
-	free(v);
-out:
-	va_end(a2);
-	return ret;
-}
-
-int gwnet_http_hdr_add(struct gwnet_http_hdr *hdr, const char *key,
-		       const char *val)
-{
-	int i;
-
-	i = gwnet_http_hdr_find_idx(hdr, key);
-	if (i >= 0) {
-		/*
-		 * If the key already exists, update the value.
-		 */
-		char *new_val = strdup(val);
-		if (!new_val)
-			return -ENOMEM;
-		free(hdr->pairs[i].val);
-		hdr->pairs[i].val = new_val;
-		return 0;
-	} else {
-		struct gwnet_http_hdr_pair *new_pairs;
-		size_t new_size;
-		char *k, *v;
-
-		/*
-		 * If the key does not exist, add a new key-value pair.
-		 */
-		k = strdup(key);
-		v = strdup(val);
-		if (!k || !v) {
-			free(k);
-			free(v);
-			return -ENOMEM;
-		}
-
-		new_size = (hdr->nr_pairs + 1) * sizeof(*hdr->pairs);
-		new_pairs = realloc(hdr->pairs, new_size);
-		if (!new_pairs) {
-			free(k);
-			free(v);
-			return -ENOMEM;
-		}
-
-		hdr->pairs = new_pairs;
-		hdr->pairs[hdr->nr_pairs].key = k;
-		hdr->pairs[hdr->nr_pairs].val = v;
-		hdr->nr_pairs++;
-		return 0;
-	}
-}
-
-static int gwnet_http_send_cb(void *data, struct gwnet_tcp_srv *s,
-			      gwnet_tcp_cli_t *c, struct gwbuf *b)
-{
-	(void)data;
-	(void)s;
-	(void)c;
-	(void)b;
-	return 0;
-}
-
-static int gwnet_http_send_cb_post(void *data, struct gwnet_tcp_srv *s,
-				   gwnet_tcp_cli_t *c, struct gwbuf *b)
-{
-	struct gwnet_http_cli *hc = data;
-
-	if (b->len == 0 && !hc->keep_alive)
-		return -ECONNRESET;
-
-	(void)s;
-	(void)c;
-	(void)b;
-	return 0;
-}
-
-static void gwnet_http_cli_free_cb(void *data, gwnet_tcp_cli_t *c)
-{
-	struct gwnet_http_cli *hc = data;
-	gwnet_http_cli_free(hc);
-
-	(void)c;
-}
-
-static int gwnet_http_accept_cb(void *data, struct gwnet_tcp_srv *s,
-				gwnet_tcp_cli_t *c)
-{
-	struct gwnet_http_srv *srv = data;
-	struct gwnet_http_cli *hc;
-
-	hc = gwnet_http_cli_alloc(srv);
-	if (!hc)
-		return -ENOMEM;
-
-	gwnet_tcp_srv_cli_set_data(c, hc);
-	gwnet_tcp_srv_cli_set_post_recv_cb(c, gwnet_http_recv_cb);
-	gwnet_tcp_srv_cli_set_pre_send_cb(c, gwnet_http_send_cb);
-	gwnet_tcp_srv_cli_set_post_send_cb(c, gwnet_http_send_cb_post);
-	gwnet_tcp_srv_cli_set_free_cb(c, gwnet_http_cli_free_cb);
-	(void)c;
-	(void)s;
-	return 0;
+	return &res->hdr;
 }
 
 static int gwnet_http_srv_validate_cfg(struct gwnet_http_srv_cfg *cfg)
@@ -893,11 +364,15 @@ static int gwnet_http_srv_validate_cfg(struct gwnet_http_srv_cfg *cfg)
 	return 0;
 }
 
+static int gwnet_http_srv_accept_cb(void *data, gwnet_tcp_srv_t *s,
+				    gwnet_tcp_cli_t *c);
+
+__cold
 gwnet_http_srv_t *gwnet_http_srv_init(const struct gwnet_http_srv_cfg *cfg)
 {
 	struct gwnet_http_srv *s;
 	int ret;
-	
+
 	s = calloc(1, sizeof(*s));
 	if (!s)
 		return NULL;
@@ -911,7 +386,7 @@ gwnet_http_srv_t *gwnet_http_srv_init(const struct gwnet_http_srv_cfg *cfg)
 	if (!s->tcp)
 		goto free_s;
 
-	gwnet_tcp_srv_set_accept_cb(s->tcp, gwnet_http_accept_cb, s);
+	gwnet_tcp_srv_set_accept_cb(s->tcp, &gwnet_http_srv_accept_cb, s);
 	return s;
 
 free_s:
@@ -919,23 +394,716 @@ free_s:
 	return NULL;
 }
 
-int gwnet_http_srv_run(gwnet_http_srv_t *s)
+__cold
+int gwnet_http_srv_run(gwnet_http_srv_t *srv)
 {
-	return gwnet_tcp_srv_run(s->tcp);
+	return gwnet_tcp_srv_run(srv->tcp);
 }
 
-void gwnet_http_srv_free(struct gwnet_http_srv *s)
+__cold
+void gwnet_http_srv_stop(gwnet_http_srv_t *srv)
 {
-	if (s) {
-		gwnet_tcp_srv_free(s->tcp);
-		memset(s, 0, sizeof(*s));
-		free(s);
+	gwnet_tcp_srv_stop(srv->tcp);
+}
+
+__cold
+void gwnet_http_srv_free(gwnet_http_srv_t *srv)
+{
+	gwnet_tcp_srv_free(srv->tcp);
+	free(srv);
+}
+
+__hot
+static void gwnet_http_res_free(struct gwnet_http_res *res)
+{
+	if (!res)
+		return;
+
+	gwnet_http_res_body_free(&res->body);
+	gwnet_http_hdr_fields_free(&res->hdr);
+}
+
+__hot
+static gwnet_http_req_t *gwnet_http_req_alloc(void)
+{
+	gwnet_http_req_t *req = calloc(1, sizeof(*req));
+	int r;
+
+	if (!req)
+		return NULL;
+
+	r = gwnet_http_hdr_pctx_init(&req->hpctx);
+	if (r < 0) {
+		free(req);
+		return NULL;
+	}
+
+	return req;
+}
+
+__hot
+static void http_req_free(gwnet_http_req_t *req)
+{
+	if (!req)
+		return;
+
+	free(req->uri);
+	free(req->qs);
+	free(req->content_type);
+	gwbuf_free(&req->body_buf);
+	gwnet_http_req_hdr_free(&req->hdr);
+	gwnet_http_res_free(&req->res);
+	free(req);
+}
+
+__hot
+static void free_requests(struct gwnet_http_cli *hc)
+{
+	gwnet_http_req_t *req = hc->req_head;
+
+	while (req) {
+		gwnet_http_req_t *next = req->next;
+		http_req_free(req);
+		req = next;
+	}
+
+	hc->req_head = hc->req_tail = NULL;
+}
+
+__hot
+static void req_push(gwnet_http_cli_t *hc, gwnet_http_req_t *req)
+{
+	if (!hc->req_head) {
+		hc->req_head = hc->req_tail = req;
+	} else {
+		hc->req_tail->next = req;
+		hc->req_tail = req;
 	}
 }
 
-void gwnet_http_srv_set_route_cb(gwnet_http_srv_t *s,
-				 gwnet_http_srv_route_cb_t cb, void *data)
+__hot
+static void gwnet_http_srv_cli_req_pop_head(gwnet_http_cli_t *hc)
 {
-	s->data_cb = data;
-	s->route_cb = cb;
+	gwnet_http_req_t *req = hc->req_head;
+
+	if (!req)
+		return;
+
+	hc->req_head = req->next;
+	if (!hc->req_head)
+		hc->req_tail = NULL;
+
+	http_req_free(req);
+}
+
+static gwnet_http_req_t *gwnet_http_srv_cli_req_head(gwnet_http_cli_t *hc)
+{
+	return hc->req_head;
+}
+
+static struct gwnet_http_cli *gwnet_http_cli_alloc(gwnet_http_srv_t *srv)
+{
+	struct gwnet_http_cli *hc = calloc(1, sizeof(*hc));
+	if (!hc)
+		return NULL;
+
+	hc->tx_state = GWNET_HTTP_TX_ST_INIT;
+	hc->rx_state = GWNET_HTTP_RX_ST_INIT;
+	hc->srv = srv;
+	return hc;
+}
+
+__hot
+static void gwnet_http_cli_free(struct gwnet_http_cli *hc)
+{
+	if (!hc)
+		return;
+
+	free_requests(hc);
+	free(hc);
+}
+
+__hot
+static int handle_rx_st_init(gwnet_http_cli_t *hc, struct gwbuf *b)
+{
+	gwnet_http_req_t *req;
+
+	if (!b->len)
+		return -EAGAIN;
+
+	req = gwnet_http_req_alloc();
+	if (!req)
+		return -ENOMEM;
+
+	req_push(hc, req);
+	hc->rx_state = GWNET_HTTP_RX_ST_HDR;
+	return 1;
+}
+
+__hot
+static int process_req_hdr(gwnet_http_cli_t *hc, struct gwnet_http_req *req)
+{
+	struct gwnet_http_hdr_fields *ff = &req->hdr.fields;
+	const char *v;
+	char *e;
+	
+	/*
+	 * TODO(ammarfaizi2): Handle keep-alive with timeout.
+	 */
+	v = gwnet_http_hdr_fields_get(ff, "connection");
+	if (v)
+		req->keep_alive = !strcasecmp(v, "keep-alive");
+	else
+		req->keep_alive = (req->hdr.version == GWNET_HTTP_VER_1_1);
+
+	v = gwnet_http_hdr_fields_get(ff, "content-length");
+	if (v) {
+		if (gwnet_http_hdr_fields_get(ff, "transfer-encoding"))
+			return -EINVAL;
+
+		errno = 0;
+		req->con_len = strtoull(v, &e, 10);
+		if (errno || *e)
+			return -EINVAL;
+
+		req->rcon_len = req->con_len;
+		req->is_chunked = false;
+		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
+		return 1;
+	}
+
+	/*
+	 * TODO(ammarfaizi2): Handle various transfer encodings
+	 * other than chunked.
+	 */
+	v = gwnet_http_hdr_fields_get(ff, "transfer-encoding");
+	if (v) {
+		req->is_chunked = !strcasecmp(v, "chunked");
+		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
+		return gwnet_http_body_pctx_init(&req->bpctx);
+	}
+
+	hc->rx_state = GWNET_HTTP_RX_ST_DONE;
+	return 0;
+}
+
+__hot
+static int handle_rx_st_hdr(gwnet_http_cli_t *hc, struct gwbuf *b)
+{
+	struct gwnet_http_req *req = hc->req_tail;
+	int r;
+
+	if (!req)
+		return -EINVAL;
+	if (!b->len)
+		return -EAGAIN;
+
+	req->hpctx.buf = b->buf;
+	req->hpctx.len = b->len;
+	req->hpctx.off = 0;
+	r = gwnet_http_req_hdr_parse(&req->hpctx, &req->hdr);
+	if (req->hpctx.off)
+		gwbuf_soft_advance(b, req->hpctx.off);
+
+	if (r < 0)
+		return r;
+
+	r = process_req_hdr(hc, req);
+	if (r < 0)
+		return r;
+
+	if (hc->rt_on_hdr_cb) {
+		r = hc->rt_on_hdr_cb(hc->data_cb, hc->srv, hc, req);
+		if (r < 0)
+			return r;
+	}
+
+	return 1;
+}
+
+__hot
+static int handle_rx_st_body_chunked(gwnet_http_cli_t *hc,
+				     struct gwnet_http_req *req,
+				     struct gwbuf *b)
+{
+	size_t max_req_body_len = hc->srv->cfg.max_req_body_len;
+	struct gwnet_http_body_pctx *x = &req->bpctx;
+	uint64_t to_copy, copied, prev_tot_len;
+	struct gwbuf *bb = &req->body_buf;
+	char *dst_buf;
+	int r = 0;
+
+loop:
+	to_copy = bb->cap - bb->len;
+	if (!to_copy) {
+		r = gwbuf_prepare_need(bb, 4096);
+		if (unlikely(r < 0))
+			return r;
+
+		to_copy = bb->cap - bb->len;
+	}
+
+	if (req->is_body_oversized) {
+		dst_buf = NULL;
+		to_copy = 0;
+		prev_tot_len = 0;
+	} else {
+		if (to_copy + bb->len > max_req_body_len) {
+			req->is_body_oversized = true;
+			to_copy = max_req_body_len - bb->len;
+		}
+
+		dst_buf = &bb->buf[bb->len];
+		prev_tot_len = x->tot_len;
+	}
+
+	x->buf = b->buf;
+	x->len = b->len;
+	x->off = 0;
+	r = gwnet_http_body_parse_chunked(x, dst_buf, to_copy);
+	if (x->off)
+		gwbuf_soft_advance(b, x->off);
+
+	if (!req->is_body_oversized) {
+		copied = x->tot_len - prev_tot_len;
+		bb->len += copied;
+	}
+
+	if (r == -ENOBUFS)
+		goto loop;
+
+	return r;
+}
+
+__hot
+static int handle_rx_st_body_non_chunked(gwnet_http_cli_t *hc,
+					 struct gwnet_http_req *req,
+					 struct gwbuf *b)
+{
+	size_t max_req_body_len = hc->srv->cfg.max_req_body_len;
+	size_t to_copy_len, orig_to_copy_len;
+	struct gwbuf *bb = &req->body_buf;
+	int r;
+
+	orig_to_copy_len = to_copy_len = min_st(req->rcon_len, b->len);
+
+	if (!req->is_body_oversized) {
+		if (to_copy_len + bb->len > max_req_body_len) {
+			req->is_body_oversized = true;
+			to_copy_len = max_req_body_len - bb->len;
+		}
+
+		r = gwbuf_append(bb, b->buf, to_copy_len);
+		if (r < 0)
+			return r;
+	}
+
+	gwbuf_soft_advance(b, orig_to_copy_len);
+	req->rcon_len -= orig_to_copy_len;
+	return (req->rcon_len > 0) ? -EAGAIN : 0;
+}
+
+__hot
+static int handle_rx_st_body(gwnet_http_cli_t *hc, struct gwbuf *b)
+{
+	struct gwnet_http_req *req = hc->req_tail;
+	int r;
+
+	if (!req)
+		return -EINVAL;
+	if (!b->len)
+		return -EAGAIN;
+
+	if (req->is_chunked)
+		r = handle_rx_st_body_chunked(hc, req, b);
+	else
+		r = handle_rx_st_body_non_chunked(hc, req, b);
+
+	if (r < 0)
+		return r;
+
+	if (hc->rt_on_body_cb) {
+		r = hc->rt_on_body_cb(hc->data_cb, hc->srv, hc, req);
+		if (r < 0)
+			return r;
+	}
+
+	hc->rx_state = GWNET_HTTP_RX_ST_DONE;
+	return 1;
+}
+
+static int default_hello_world_resp(gwnet_http_req_t *req)
+{
+	struct gwnet_http_res *res = gwnet_http_req_get_res(req);
+	struct gwbuf b;
+	int r;
+
+	r = gwbuf_init(&b, 13);
+	if (r < 0)
+		return r;
+
+	r = gwbuf_append(&b, "Hello World!\n", 13);
+	if (r < 0)
+		return r;
+
+	gwnet_http_res_set_code(res, 200);
+	gwnet_http_res_set_content_type(res, "text/plain; charset=utf-8");
+	gwnet_http_res_body_set_buf(res, &b);
+	return 0;
+}
+
+__hot
+static int handle_rx_st_done(gwnet_http_cli_t *hc)
+{
+	struct gwnet_http_req *req = hc->req_tail;
+	int r;
+
+	if (!req)
+		return -EINVAL;
+
+	if (hc->rt_cb)
+		r = hc->rt_cb(hc->data_cb, hc->srv, hc, req);
+	else
+		r = default_hello_world_resp(req);
+
+	if (r > 0)
+		r = 0;
+
+	if (!r)
+		hc->rx_state = GWNET_HTTP_RX_ST_INIT;
+
+	if (!req->keep_alive)
+		hc->stop_receiving = true;
+
+	return r;
+}
+
+__hot
+static int handle_rx(gwnet_http_cli_t *hc, struct gwbuf *b)
+{
+	int r = -EINVAL;
+
+	switch (hc->rx_state) {
+	case GWNET_HTTP_RX_ST_INIT:
+		r = handle_rx_st_init(hc, b);
+		break;
+	case GWNET_HTTP_RX_ST_HDR:
+		r = handle_rx_st_hdr(hc, b);
+		break;
+	case GWNET_HTTP_RX_ST_BODY:
+		r = handle_rx_st_body(hc, b);
+		break;
+	case GWNET_HTTP_RX_ST_DONE:
+		r = handle_rx_st_done(hc);
+		break;
+	}
+
+	return r;
+}
+
+__hot
+static int prepare_content_related_headers(struct gwnet_http_hdr_fields *hf,
+					   struct gwnet_http_res *res)
+{
+	struct gwnet_http_res_body *body = &res->body;
+	uint64_t len;
+
+	switch (body->type) {
+	case GWNET_HTTP_RES_TYPE_NO_CONTENT:
+		return 0;
+	case GWNET_HTTP_RES_TYPE_BUF:
+		len = body->buf.buf.len;
+		break;
+	case GWNET_HTTP_RES_TYPE_ZERO:
+		len = body->zero.zero_len;
+		break;
+	case GWNET_HTTP_RES_TYPE_URANDOM:
+		len = body->urandom.ur_len;
+		break;
+	case GWNET_HTTP_RES_TYPE_FILE:
+		len = body->file.file_len;
+		break;
+	default:
+		assert(0 && "Unknown response body type");
+		return -EINVAL;
+	}
+
+	if (res->content_type[0]) {
+		int r = gwnet_http_hdr_fields_add(hf, "Content-Type",
+						  res->content_type);
+		if (r < 0)
+			return r;
+	}
+
+	return gwnet_http_hdr_fields_addf(hf, "Content-Length", "%llu",
+					  (unsigned long long)len);
+}
+
+__hot
+static int prepare_date_header(struct gwnet_http_hdr_fields *hf)
+{
+	time_t now = time(NULL);
+	char date[64];
+	struct tm tm;
+	size_t len;
+
+	if (!gmtime_r(&now, &tm))
+		return 0;
+
+	len = strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", &tm);
+	if (len == 0)
+		return -EINVAL;
+
+	return gwnet_http_hdr_fields_add(hf, "Date", date);
+}
+
+__hot
+static int handle_tx_init(struct gwnet_http_cli *hc, struct gwnet_http_req *req)
+{
+	const char *conn = req->keep_alive ? "keep-alive" : "close";
+	struct gwnet_http_res *res = &req->res;
+	struct gwnet_http_hdr_fields *hf = &res->hdr;
+	int r = 0;
+
+	if (!res->status)
+		res->status = 200;
+
+	res->version = req->hdr.version;
+	r |= gwnet_http_hdr_fields_add(hf, "Server", "gwhttpd2");
+	r |= prepare_date_header(hf);
+	r |= gwnet_http_hdr_fields_add(hf, "Connection", conn);
+	r |= prepare_content_related_headers(hf, res);
+	if (r < 0)
+		return r;
+	
+	hc->tx_state = GWNET_HTTP_TX_ST_HDR;
+	return 1;
+}
+
+__hot
+static int handle_tx_hdr(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
+			 struct gwbuf *b)
+{
+	struct gwnet_http_res *res = &req->res;
+	const char *stt = translate_http_code(res->status);
+	int r = 0;
+	size_t i;
+	char ver;
+
+	ver = (res->version == GWNET_HTTP_VER_1_0) ? '0' : '1';
+	r |= gwbuf_apfmt(b, "HTTP/1.%c %d %s\r\n", ver, res->status, stt);
+	for (i = 0; i < res->hdr.nr; i++) {
+		struct gwnet_http_hdr_field *f = &res->hdr.ff[i];
+		r |= gwbuf_append(b, f->key, strlen(f->key));
+		r |= gwbuf_append(b, ": ", 2);
+		r |= gwbuf_append(b, f->val, strlen(f->val));
+		r |= gwbuf_append(b, "\r\n", 2);
+	}
+	r |= gwbuf_append(b, "\r\n", 2);
+
+	if (r < 0)
+		return -ENOMEM;
+
+	hc->tx_state = GWNET_HTTP_TX_ST_BODY;
+	return 1;
+}
+
+__hot
+static int handle_tx_body(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
+			  struct gwbuf *b)
+{
+	struct gwnet_http_res *res = &req->res;
+	struct gwnet_http_res_body *body = &res->body;
+	int r = 0;
+
+	switch (body->type) {
+	case GWNET_HTTP_RES_TYPE_NO_CONTENT:
+		hc->tx_state = GWNET_HTTP_TX_ST_DONE;
+		return 1;
+	case GWNET_HTTP_RES_TYPE_BUF:
+		r = gwbuf_append(b, body->buf.buf.buf, body->buf.buf.len);
+		if (!r) {
+			gwbuf_advance(&body->buf.buf, body->buf.buf.len);
+			hc->tx_state = GWNET_HTTP_TX_ST_DONE;
+			return 1;
+		}
+		break;
+	case GWNET_HTTP_RES_TYPE_ZERO:
+	case GWNET_HTTP_RES_TYPE_URANDOM:
+	case GWNET_HTTP_RES_TYPE_FILE:
+		return -EINVAL;
+	default:
+		assert(0 && "Unknown response body type");
+		return -EINVAL;
+	}
+
+	return r;
+}
+
+__hot
+static int __handle_tx(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
+		       struct gwbuf *b)
+{
+	int r = 0;
+
+	switch (hc->tx_state) {
+	case GWNET_HTTP_TX_ST_INIT:
+		r = handle_tx_init(hc, req);
+		break;
+	case GWNET_HTTP_TX_ST_HDR:
+		r = handle_tx_hdr(hc, req, b);
+		break;
+	case GWNET_HTTP_TX_ST_BODY:
+		r = handle_tx_body(hc, req, b);
+		break;
+	case GWNET_HTTP_TX_ST_DONE:
+		hc->tx_state = GWNET_HTTP_TX_ST_INIT;
+		gwnet_http_srv_cli_req_pop_head(hc);
+		break;
+	default:
+		assert(0 && "Unknown HTTP TX state");
+		return -EINVAL;
+	}
+
+	return r;
+}
+
+__hot
+static int handle_tx(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
+{
+	struct gwnet_http_req *req = gwnet_http_srv_cli_req_head(hc);
+	struct gwnet_tcp_buf *b = gwnet_tcp_srv_cli_get_tx_buf(c);
+	struct gwbuf *sb = &b->buf;
+	int r = 0;
+
+	assert(b->type == GWNET_TCP_BUF_DEFAULT);
+
+	while (1) {
+		r = __handle_tx(hc, req, sb);
+		if (r <= 0)
+			break;
+	}
+
+	if (r == -EAGAIN)
+		r = 0;
+
+	return r;
+}
+
+__hot
+static int handle_req_done(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
+{
+	hc->rx_state = GWNET_HTTP_RX_ST_INIT;
+	if (hc->tx_state != GWNET_HTTP_TX_ST_INIT)
+		return 0;
+
+	return handle_tx(hc, c);
+}
+
+__hot
+static int gwnet_http_srv_pre_recv_cb(void *data, gwnet_tcp_srv_t *s,
+				      gwnet_tcp_cli_t *c)
+{
+	(void)data; (void)s; (void)c;
+	return 0;
+}
+
+__hot
+static int gwnet_http_srv_post_recv_cb(void *data, gwnet_tcp_srv_t *s,
+				       gwnet_tcp_cli_t *c, ssize_t recv_ret)
+{
+	struct gwnet_tcp_buf *rb = gwnet_tcp_srv_cli_get_rx_buf(c);
+	struct gwnet_http_cli *hc = data;
+	struct gwbuf *b = &rb->buf;
+	int ret = 0;
+
+	assert(rb->type == GWNET_TCP_BUF_DEFAULT);
+
+	if (hc->stop_receiving) {
+		gwbuf_advance(b, b->len);
+		return 0;
+	}
+
+	while (1) {
+		ret = handle_rx(hc, b);
+		if (ret < 0)
+			break;
+
+		if (ret == 0) {
+			ret = handle_req_done(hc, c);
+			if (ret)
+				break;
+		}
+	}
+
+	if (ret == -EAGAIN)
+		ret = 0;
+
+	gwbuf_soft_advance_sync(b);
+	return ret;
+	(void)s;
+	(void)recv_ret;
+}
+
+__hot
+static int gwnet_http_srv_pre_send_cb(void *data, gwnet_tcp_srv_t *s,
+				      gwnet_tcp_cli_t *c)
+{
+	struct gwnet_http_cli *hc = data;
+	(void)s;
+	(void)c;
+	(void)hc;
+	return 0;
+}
+
+__hot
+static int gwnet_http_srv_post_send_cb(void *data, gwnet_tcp_srv_t *s,
+				       gwnet_tcp_cli_t *c, ssize_t send_ret)
+{
+	struct gwnet_http_cli *hc = data;
+	struct gwnet_tcp_buf *tb = gwnet_tcp_srv_cli_get_tx_buf(c);
+	struct gwbuf *b = &tb->buf;
+
+	if (hc->stop_receiving && !b->len)
+		return -ECONNRESET;
+
+	return 0;
+	(void)s;
+	(void)send_ret;
+}
+
+__hot
+static void gwnet_http_srv_free_cb(void *data, gwnet_tcp_cli_t *c)
+{
+	struct gwnet_http_cli *hc = data;
+
+	gwnet_http_cli_free(hc);
+	(void)c;
+}
+
+__hot
+static int gwnet_http_srv_accept_cb(void *data, gwnet_tcp_srv_t *s,
+				    gwnet_tcp_cli_t *c)
+{
+	struct gwnet_http_srv *srv = data;
+	struct gwnet_http_cli *hc = gwnet_http_cli_alloc(srv);
+	if (!hc)
+		return -ENOMEM;
+
+	if (srv->accept_cb) {
+		int r = srv->accept_cb(srv->data_cb, srv, hc);
+		if (r < 0) {
+			gwnet_http_cli_free(hc);
+			return r;
+		}
+	}
+
+	gwnet_tcp_srv_cli_set_data(c, hc);
+	gwnet_tcp_srv_cli_set_free_cb(c, &gwnet_http_srv_free_cb);
+	gwnet_tcp_srv_cli_set_pre_recv_cb(c, &gwnet_http_srv_pre_recv_cb);
+	gwnet_tcp_srv_cli_set_post_recv_cb(c, &gwnet_http_srv_post_recv_cb);
+	gwnet_tcp_srv_cli_set_pre_send_cb(c, &gwnet_http_srv_pre_send_cb);
+	gwnet_tcp_srv_cli_set_post_send_cb(c, &gwnet_http_srv_post_send_cb);
+	return 0;
+	(void)s;
 }

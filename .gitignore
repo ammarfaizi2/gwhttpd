@@ -1,4 +1,4 @@
-/gwhttpd2
+/gwhttpd
 *.o
 *.o.d
 /.vscode/
