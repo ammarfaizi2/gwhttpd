@@ -1,1 +1,3 @@
 /gwhttpd2
+*.o
+*.o.d
