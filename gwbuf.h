@@ -20,5 +20,6 @@ void gwbuf_advance(struct gwbuf *b, size_t len);
 int gwbuf_set_cap(struct gwbuf *b, size_t cap);
 int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...);
 int gwbuf_append(struct gwbuf *b, const void *data, size_t len);
+void gwbuf_move(struct gwbuf *dst, struct gwbuf *src);
 
 #endif /* #ifndef GWBUF_H */

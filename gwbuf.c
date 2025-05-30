@@ -132,3 +132,17 @@ int gwbuf_append(struct gwbuf *b, const void *data, size_t len)
 	b->buf[b->len] = b->buf[b->cap] = '\0';
 	return 0;
 }
+
+void gwbuf_move(struct gwbuf *dst, struct gwbuf *src)
+{
+	if (dst->buf)
+		free(dst->buf);
+
+	dst->buf = src->buf;
+	dst->len = src->len;
+	dst->cap = src->cap;
+
+	src->buf = NULL;
+	src->len = 0;
+	src->cap = 0;
+}

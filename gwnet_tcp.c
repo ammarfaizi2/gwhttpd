@@ -26,6 +26,7 @@
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <arpa/inet.h>
@@ -52,31 +53,35 @@ enum {
 struct gwnet_tcp_cli {
 	int				fd;
 	struct gwsockaddr		addr;
-	struct gwbuf			tx_buf;
-	struct gwbuf			rx_buf;
+	struct gwnet_tcp_buf		tx_buf;
+	struct gwnet_tcp_buf		rx_buf;
 	uint32_t			ep_mask;
 	uint64_t			conn_id;
+
+	gwnet_tcp_cli_pre_recv_t	pre_recv_cb;
 	gwnet_tcp_cli_post_recv_t	post_recv_cb;
 	gwnet_tcp_cli_pre_send_t	pre_send_cb;
 	gwnet_tcp_cli_post_send_t	post_send_cb;
 	gwnet_tcp_cli_free_t		free_cb;
-	void				*data;
+	void				*udata;
+	struct gwnet_tcp_srv		*ctx;
+	uint32_t			idx;
 };
 
-struct gwstack16 {
-	uint16_t		sp;
-	uint16_t		bp;
-	uint16_t		*arr;
+struct gwstack32 {
+	uint32_t		sp;
+	uint32_t		bp;
+	uint32_t		*arr;
 	pthread_mutex_t		lock;
 };
 
 struct gwnet_tcp_cli_bucket {
-	struct gwstack16		stack;
+	struct gwstack32		stack;
 	struct gwnet_tcp_cli		*arr;
 	struct gwnet_tcp_cli_bucket	*next;
 };
 
-#define GWTCP_SRV_NR_EVENTS_EPOLL 64
+#define GWTCP_SRV_NR_EVENTS_EPOLL 512
 
 struct gwnet_tcp_srv_wrk {
 	int			ep_fd;
@@ -107,7 +112,7 @@ struct gwnet_tcp_srv {
 	void				*accept_cb_data;
 };
 
-static int gwstack16_init(struct gwstack16 *s, size_t cap)
+static int gwstack32_init(struct gwstack32 *s, size_t cap)
 {
 	int ret;
 
@@ -129,7 +134,7 @@ static int gwstack16_init(struct gwstack16 *s, size_t cap)
 	return 0;
 }
 
-static void gwstack16_free(struct gwstack16 *s)
+static void gwstack32_free(struct gwstack32 *s)
 {
 	if (!s || !s->arr)
 		return;
@@ -141,7 +146,7 @@ static void gwstack16_free(struct gwstack16 *s)
 	s->bp = 0;
 }
 
-static int __gwstack16_push(struct gwstack16 *s, uint16_t v)
+static int __gwstack32_push(struct gwstack32 *s, uint32_t v)
 {
 	if (!s->sp)
 		return -EAGAIN;
@@ -150,17 +155,17 @@ static int __gwstack16_push(struct gwstack16 *s, uint16_t v)
 	return 0;
 }
 
-static int gwstack16_push(struct gwstack16 *s, uint16_t v)
+static int gwstack32_push(struct gwstack32 *s, uint32_t v)
 {
 	int ret;
 
 	pthread_mutex_lock(&s->lock);
-	ret = __gwstack16_push(s, v);
+	ret = __gwstack32_push(s, v);
 	pthread_mutex_unlock(&s->lock);
 	return ret;
 }
 
-static int __gwstack16_pop(struct gwstack16 *s, uint16_t *v)
+static int __gwstack32_pop(struct gwstack32 *s, uint32_t *v)
 {
 	if (s->sp == s->bp)
 		return -EAGAIN;
@@ -169,31 +174,31 @@ static int __gwstack16_pop(struct gwstack16 *s, uint16_t *v)
 	return 0;
 }
 
-static int gwstack16_pop(struct gwstack16 *s, uint16_t *v)
+static int gwstack32_pop(struct gwstack32 *s, uint32_t *v)
 {
 	int ret;
 
 	pthread_mutex_lock(&s->lock);
-	ret = __gwstack16_pop(s, v);
+	ret = __gwstack32_pop(s, v);
 	pthread_mutex_unlock(&s->lock);
 	return ret;
 }
 
-#define NR_CLIENTS_PER_BUCKET 30000
+#define NR_CLIENTS_PER_BUCKET 300000
 
 static int gwnet_tcp_srv_init_client_bucket(struct gwnet_tcp_srv *s)
 {
 	struct gwnet_tcp_cli_bucket *c = &s->clients;
-	uint16_t i;
+	uint32_t i;
 	int ret;
 
-	ret = gwstack16_init(&c->stack, NR_CLIENTS_PER_BUCKET);
+	ret = gwstack32_init(&c->stack, NR_CLIENTS_PER_BUCKET);
 	if (ret)
 		return ret;
 
 	c->arr = calloc(NR_CLIENTS_PER_BUCKET, sizeof(*c->arr));
 	if (!c->arr) {
-		gwstack16_free(&c->stack);
+		gwstack32_free(&c->stack);
 		return -ENOMEM;
 	}
 
@@ -201,29 +206,46 @@ static int gwnet_tcp_srv_init_client_bucket(struct gwnet_tcp_srv *s)
 	i = NR_CLIENTS_PER_BUCKET;
 	while (i--) {
 		c->arr[i].fd = -1;
-		__gwstack16_push(&c->stack, i);
+		c->arr[i].idx = i;
+		__gwstack32_push(&c->stack, i);
 	}
 
 	return 0;
 }
 
-static void gwnet_tcp_srv_free_client(struct gwnet_tcp_cli *c)
+static void gwnet_tcp_buf_free(struct gwnet_tcp_buf *buf)
 {
-	if (c->free_cb)
-		c->free_cb(c->data, c);
+	if (!buf)
+		return;
 
-	if (c->fd >= 0) {
-		close(c->fd);
-		c->fd = -1;
+	if (buf->type == GWNET_TCP_BUF_CUSTOM) {
+		if (buf->cust.free_fn)
+			buf->cust.free_fn(buf->cust.udata);
+	} else {
+		gwbuf_free(&buf->buf);
 	}
 
-	gwbuf_free(&c->tx_buf);
-	gwbuf_free(&c->rx_buf);
-	c->post_recv_cb = NULL;
-	c->pre_send_cb = NULL;
-	c->post_send_cb = NULL;
-	c->free_cb = NULL;
-	c->conn_id = 0;
+	memset(buf, 0, sizeof(*buf));
+	buf->type = GWNET_TCP_BUF_DEFAULT;
+}
+
+static void gwnet_tcp_srv_free_client(struct gwnet_tcp_cli *c)
+{
+	struct gwnet_tcp_srv *s = c->ctx;
+	uint32_t idx = c->idx;
+
+	if (c->free_cb)
+		c->free_cb(c->udata, c);
+
+	if (c->fd >= 0)
+		close(c->fd);
+
+	gwnet_tcp_buf_free(&c->tx_buf);
+	gwnet_tcp_buf_free(&c->rx_buf);
+	memset(c, 0, sizeof(*c));
+	c->fd = -1;
+	c->idx = idx;
+	c->ctx = s;
 }
 
 static void gwnet_tcp_srv_free_client_bucket(struct gwnet_tcp_srv *s)
@@ -239,7 +261,7 @@ static void gwnet_tcp_srv_free_client_bucket(struct gwnet_tcp_srv *s)
 				gwnet_tcp_srv_free_client(&cur->arr[i]);
 		}
 
-		gwstack16_free(&cur->stack);
+		gwstack32_free(&cur->stack);
 		free(cur->arr);
 		if (cur != &s->clients)
 			free(cur);
@@ -461,6 +483,7 @@ static int gwnet_tcp_srv_init_workers(struct gwnet_tcp_srv *s)
 	s->nr_workers = cfg->nr_workers;
 
 	return 0;
+
 free_workers:
 	s->should_stop = true;
 	while (i--)
@@ -474,10 +497,10 @@ static int gwnet_tcp_srv_get_client(struct gwnet_tcp_srv *ctx,
 				    struct gwnet_tcp_cli **cp)
 {
 	struct gwnet_tcp_cli *c;
-	uint16_t idx;
+	uint32_t idx;
 	int ret;
 
-	ret = gwstack16_pop(&ctx->clients.stack, &idx);
+	ret = gwstack32_pop(&ctx->clients.stack, &idx);
 	if (ret) {
 		/*
 		 * TODO(ammarfaizi2): Expand the client bucket if we
@@ -487,10 +510,19 @@ static int gwnet_tcp_srv_get_client(struct gwnet_tcp_srv *ctx,
 	}
 
 	c = &ctx->clients.arr[idx];
-	ret = gwbuf_init(&c->tx_buf, 0);
+	assert(c->idx == idx);
+	c->tx_buf.type = GWNET_TCP_BUF_DEFAULT;
+	c->rx_buf.type = GWNET_TCP_BUF_DEFAULT;
+
+	c->pre_recv_cb = NULL;
+	c->post_recv_cb = NULL;
+	c->pre_send_cb = NULL;
+	c->post_send_cb = NULL;
+
+	ret = gwbuf_init(&c->tx_buf.buf, 0);
 	if (ret)
 		goto out_err;
-	ret = gwbuf_init(&c->rx_buf, 0);
+	ret = gwbuf_init(&c->rx_buf.buf, 0);
 	if (ret)
 		goto out_free_tx_buf;
 
@@ -499,9 +531,9 @@ static int gwnet_tcp_srv_get_client(struct gwnet_tcp_srv *ctx,
 	return 0;
 
 out_free_tx_buf:
-	gwbuf_free(&c->tx_buf);
+	gwnet_tcp_buf_free(&c->tx_buf);
 out_err:
-	gwstack16_push(&ctx->clients.stack, idx);
+	gwstack32_push(&ctx->clients.stack, idx);
 	return ret;
 }
 
@@ -509,16 +541,23 @@ static int gwnet_tcp_srv_put_client(struct gwnet_tcp_srv_wrk *w,
 				    struct gwnet_tcp_cli *c)
 {
 	struct gwnet_tcp_srv *ctx = w->ctx;
+	int ret;
+
+	if (c->fd >= 0) {
+		ret = epoll_ctl(w->ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
+		if (unlikely(ret < 0))
+			return -errno;
+	}
 
 	/*
 	 * TODO(ammarfaizi2): Handle the client bucket expansion.
 	 */
 	gwnet_tcp_srv_free_client(c);
-	gwstack16_push(&ctx->clients.stack, c - ctx->clients.arr);
+	gwstack32_push(&ctx->clients.stack, c->idx);
 	atomic_fetch_sub(&w->nr_on_clients, 1ull);
 
 	if (unlikely(ctx->accept_stopped)) {
-		int ret, ep_fd = ctx->workers[0].ep_fd;
+		int ep_fd = ctx->workers[0].ep_fd;
 		struct epoll_event ev;
 
 		ctx->accept_stopped = false;
@@ -526,12 +565,12 @@ static int gwnet_tcp_srv_put_client(struct gwnet_tcp_srv_wrk *w,
 		ev.data.u64 = GWNET_EPL_EV_ACCEPT;
 
 		ret = epoll_ctl(ep_fd, EPOLL_CTL_MOD, ctx->fd, &ev);
-		if (ret < 0)
+		if (unlikely(ret < 0))
 			return -errno;
 
 		if (w != &ctx->workers[0]) {
 			ret = gwnet_tcp_srv_ev_signal(w);
-			if (ret < 0)
+			if (unlikely(ret < 0))
 				return ret;
 		}
 	}
@@ -576,40 +615,21 @@ static int gwnet_tcp_srv_handle_accept_err(struct gwnet_tcp_srv_wrk *w,
 static int gwnet_tcp_srv_pass_client(struct gwnet_tcp_srv_wrk *w_from,
 				     struct gwnet_tcp_cli *c)
 {
-	static const uint16_t minimum_nr_clients = 16;
 	struct gwnet_tcp_srv *ctx = w_from->ctx;
-	struct gwnet_tcp_srv_wrk *w = NULL, *workers = ctx->workers;
+	struct gwnet_tcp_srv_wrk *w;
 	struct epoll_event ev;
 	int ret;
 
-	if (ctx->nr_workers == 1) {
-		w = &workers[0];
-	} else {
-		uint16_t i, n, min = workers[0].nr_on_clients;
-
-		for (i = 0; i < ctx->nr_workers; i++) {
-			w = &workers[i];
-			n = atomic_load(&w->nr_on_clients);
-
-			if (n < minimum_nr_clients)
-				break;
-
-			if (n < min) {
-				min = n;
-				w = &workers[i];
-			}
-		}
-	}
-
+	w = &ctx->workers[c->conn_id % ctx->nr_workers];
 	ev.events = EPOLLIN;
 	ev.data.u64 = 0;
 	ev.data.ptr = c;
 	ev.data.u64 |= GWNET_EPL_EV_CLIENT;
+	c->ep_mask = ev.events;
 	ret = epoll_ctl(w->ep_fd, EPOLL_CTL_ADD, c->fd, &ev);
 	if (unlikely(ret < 0))
 		return -errno;
 
-	c->ep_mask = ev.events;
 	atomic_fetch_add(&w->nr_on_clients, 1ull);
 	if (w != w_from)
 		return gwnet_tcp_srv_ev_signal(w);
@@ -617,7 +637,35 @@ static int gwnet_tcp_srv_pass_client(struct gwnet_tcp_srv_wrk *w_from,
 	return 0;
 }
 
-static int gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
+static int gwnet_tcp_srv_handle_accept_opts(int fd)
+{
+	int r = 0, v;
+
+	v = 1;
+	r |= setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v, sizeof(v));
+
+	/*
+	 * Wait 5 seconds before sending the first probe.
+	 */
+	v = 5;
+	r |= setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v));
+
+	/*
+	 * Then every 5 seconds send a probe.
+	 */
+	v = 3;
+	r |= setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
+
+	/*
+	 * Give up after 3 unanswered probes.
+	 */
+	v = 3;
+	r |= setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v));
+
+	return r;
+}
+
+static int __gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
 {
 	struct sockaddr_storage addr;
 	struct gwnet_tcp_srv *ctx;
@@ -626,20 +674,29 @@ static int gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
 	int ret, fd;
 
 	ctx = w->ctx;
+	ret = gwnet_tcp_srv_get_client(ctx, &c);
+	if (unlikely(ret)) {
+		printf("run out of client slot!\n");
+		return gwnet_tcp_srv_handle_accept_err(w, -ENFILE);
+	}
+
 	sa = (struct sockaddr *)&addr;
 	fd = accept4(ctx->fd, sa, &ctx->addr_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
-	if (unlikely(fd < 0))
-		return gwnet_tcp_srv_handle_accept_err(w, -errno);
-
-	ret = gwnet_tcp_srv_get_client(ctx, &c);
-	if (unlikely(ret))
-		goto out_close;
+	if (unlikely(fd < 0)) {
+		int err = -errno;
+		ret = gwnet_tcp_srv_put_client(w, c);
+		return ret ? ret : gwnet_tcp_srv_handle_accept_err(w, err);
+	}
 
 	c->fd = fd;
 	if (sa->sa_family == AF_INET)
 		c->addr.in = *(struct sockaddr_in *)sa;
 	else
 		c->addr.in6 = *(struct sockaddr_in6 *)sa;
+
+	ret = gwnet_tcp_srv_handle_accept_opts(fd);
+	if (unlikely(ret < 0))
+		goto out_put_client;
 
 	if (ctx->accept_cb) {
 		ret = ctx->accept_cb(ctx->accept_cb_data, ctx, c);
@@ -651,12 +708,24 @@ static int gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
 	if (unlikely(ret < 0))
 		goto out_put_client;
 
-	return 0;
+	return 1;
 
 out_put_client:
 	gwnet_tcp_srv_put_client(w, c);
-out_close:
-	close(fd);
+	return 0;
+}
+
+static int gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
+{
+	uint32_t i = 128;
+	int ret = 0;
+
+	while (i--) {
+		ret = __gwnet_tcp_srv_handle_accept(w);
+		if (ret <= 0)
+			break;
+	}
+
 	return 0;
 }
 
@@ -680,79 +749,176 @@ static int gwnet_tcp_srv_handle_eventfd(struct gwnet_tcp_srv_wrk *w)
 	return 0;
 }
 
-static int gwnet_tcp_srv_do_recv(struct gwnet_tcp_cli *c)
+/*
+ * Allow the client to provide a custom buffer for receiving data.
+ */
+static int gwnet_tcp_buf_get_rx_ptrnlen(struct gwnet_tcp_cli *c,
+					void **buf_p, size_t *len_p,
+					bool exec_pre_cb)
+{
+	struct gwnet_tcp_buf *b = &c->rx_buf;
+	int ret;
+
+	if (exec_pre_cb && c->pre_recv_cb) {
+		ret = c->pre_recv_cb(c->udata, c->ctx, c);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (b->type == GWNET_TCP_BUF_CUSTOM) {
+		if (!b->cust.buf || !b->cust.len)
+			return -ENOBUFS;
+		*buf_p = b->cust.buf;
+		*len_p = b->cust.len;
+		return 0;
+	} else if (b->type == GWNET_TCP_BUF_DEFAULT) {
+		size_t len = b->buf.cap - b->buf.len;
+
+		if (!len) {
+			if (gwbuf_increase(&b->buf, 1023) < 0)
+				return -ENOMEM;
+
+			len = b->buf.cap - b->buf.len;
+		}
+
+		*buf_p = b->buf.buf + b->buf.len;
+		*len_p = len;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int gwnet_tcp_buf_process_rx(struct gwnet_tcp_cli *c, ssize_t len)
+{
+	struct gwnet_tcp_buf *b = &c->rx_buf;
+	int ret;
+
+	b->buf.len += len;
+	if (c->post_recv_cb) {
+		ret = c->post_recv_cb(c->udata, c->ctx, c, len);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int gwnet_tcp_buf_get_tx_ptrnlen(struct gwnet_tcp_cli *c,
+					void **buf_p, size_t *len_p,
+					bool exec_pre_cb)
+{
+	struct gwnet_tcp_buf *b = &c->tx_buf;
+	int ret;
+
+	if (exec_pre_cb && c->pre_send_cb) {
+		ret = c->pre_send_cb(c->udata, c->ctx, c);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (b->type == GWNET_TCP_BUF_CUSTOM) {
+		if (!b->cust.buf || !b->cust.len)
+			return -ENOBUFS;
+		*buf_p = b->cust.buf;
+		*len_p = b->cust.len;
+		return 0;
+	} else if (b->type == GWNET_TCP_BUF_DEFAULT) {
+		*buf_p = b->buf.buf;
+		*len_p = b->buf.len;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int gwnet_tcp_buf_adv_tx(struct gwnet_tcp_cli *c, ssize_t len)
+{
+	struct gwnet_tcp_buf *b = &c->tx_buf;
+	int ret;
+
+	if (b->type == GWNET_TCP_BUF_DEFAULT)
+		gwbuf_advance(&b->buf, len);
+
+	if (c->post_send_cb) {
+		ret = c->post_send_cb(c->udata, c->ctx, c, len);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static ssize_t gwnet_tcp_srv_do_recv(struct gwnet_tcp_cli *c)
 {
 	ssize_t ret;
 	size_t len;
 	char *buf;
 
-	len = c->rx_buf.cap - c->rx_buf.len;
-	if (!len) {
-		ret = gwbuf_increase(&c->rx_buf, 1023);
-		if (ret < 0)
-			return ret;
-
-		len = c->rx_buf.cap - c->rx_buf.len;
-	}
-
-	buf = c->rx_buf.buf + c->rx_buf.len;
-	ret = recv(c->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
-	if (ret < 0) {
-		ret = -errno;
-		if (ret == -EAGAIN || ret == -EINTR)
-			return 0;
-
+	ret = gwnet_tcp_buf_get_rx_ptrnlen(c, (void **)&buf, &len, true);
+	if (ret < 0)
 		return ret;
-	}
 
-	if (ret == 0)
-		return -ECONNRESET;
-
-	c->rx_buf.len += ret;
-	c->rx_buf.buf[c->rx_buf.len] = '\0';
-	return 0;
-}
-
-static int gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
-{
-	struct gwbuf *t = &c->tx_buf;
-	ssize_t sent;
-	int err;
-
-	if (t->len == 0)
+	if (!len)
 		return 0;
 
-	sent = send(c->fd, t->buf, t->len, MSG_NOSIGNAL | MSG_DONTWAIT);
-	if (sent < 0) {
-		err = -errno;
-		if (err == -EAGAIN || err == -EINTR)
-			return 0;
+	ret = recv(c->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	if (ret < 0)
+		return -errno;
 
-		return err;
-	}
-
-	if (sent == 0)
+	if (!ret)
 		return -ECONNRESET;
 
-	gwbuf_advance(t, sent);
-	return 0;
+	gwnet_tcp_buf_process_rx(c, ret);
+	return ret;
+}
+
+static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
+{
+	ssize_t ret;
+	size_t len;
+	void *buf;
+
+	ret = gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &len, true);
+	if (ret < 0)
+		return ret;
+
+	if (!len)
+		return 0;
+
+	ret = send(c->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	if (ret < 0)
+		return -errno;
+
+	if (!ret)
+		return -ECONNRESET;
+
+	gwnet_tcp_buf_adv_tx(c, ret);
+	return ret;
 }
 
 static int gwnet_tcp_srv_handle_client_in(struct gwnet_tcp_srv_wrk *w,
 					  struct epoll_event *ev,
 					  struct gwnet_tcp_cli *c)
 {
-	int ret = gwnet_tcp_srv_do_recv(c);
-	if (ret < 0)
-		return ret;
+	size_t tx_len;
+	ssize_t ret;
+	void *buf;
 
-	if (c->post_recv_cb)
-		ret = c->post_recv_cb(c->data, w->ctx, c, &c->rx_buf);
+	ret = gwnet_tcp_srv_do_recv(c);
+	if (ret < 0) {
+		if (ret != -EAGAIN && ret != -EINTR)
+			return ret;
 
-	if (c->tx_buf.len > 0)
-		ev->events |= EPOLLOUT;
+		ret = 0;
+	}
 
-	return ret;
+	if (!gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &tx_len, false)) {
+		if (tx_len > 0)
+			ev->events |= EPOLLOUT;
+	}
+
+	return 0;
 }
 
 static int gwnet_tcp_srv_handle_client_out(struct gwnet_tcp_srv_wrk *w,
@@ -760,28 +926,25 @@ static int gwnet_tcp_srv_handle_client_out(struct gwnet_tcp_srv_wrk *w,
 {
 	struct epoll_event ev_out;
 	bool need_epctl = false;
-	int ret;
-
-	if (c->pre_send_cb) {
-		ret = c->pre_send_cb(c->data, w->ctx, c, &c->tx_buf);
-		if (ret < 0)
-			return ret;
-	}
+	size_t tx_len;
+	ssize_t ret;
+	void *buf;
 
 	ret = gwnet_tcp_srv_do_send(c);
-	if (ret < 0)
-		return ret;
-
-	if (c->post_send_cb) {
-		ret = c->post_send_cb(c->data, w->ctx, c, &c->tx_buf);
-		if (ret < 0)
+	if (ret < 0) {
+		if (ret != -EAGAIN && ret != -EINTR)
 			return ret;
+
+		ret = 0;
 	}
 
-	if (c->tx_buf.len == 0 && (c->ep_mask & EPOLLOUT)) {
+	if (gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &tx_len, false))
+		return 0;
+
+	if (tx_len == 0 && (c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLIN;
 		need_epctl = true;
-	} else if (c->tx_buf.len > 0 && !(c->ep_mask & EPOLLOUT)) {
+	} else if (tx_len > 0 && !(c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLOUT | EPOLLIN;
 		need_epctl = true;
 	}
@@ -817,13 +980,15 @@ static int gwnet_tcp_srv_handle_client(struct gwnet_tcp_srv_wrk *w,
 			goto out_err;
 	}
 
+	if (ev->events & (EPOLLHUP | EPOLLERR))
+		goto out_err;
+
 	return 0;
 
 out_err:
 	ret = gwnet_tcp_srv_put_client(w, c);
 	if (ret < 0)
 		return ret;
-	w->epl_need_rearm = true;
 	return 0;
 }
 
@@ -831,11 +996,10 @@ static int gwnet_tcp_srv_handle_event(struct gwnet_tcp_srv_wrk *w,
 				      struct epoll_event *ev)
 {
 	uint64_t ev_type = GWNET_EPL_EV_GET_EV(ev->data.u64);
-	int ret;
+	int ret = 0;
 
 	switch (ev_type) {
 	case GWNET_EPL_EV_ACCEPT:
-		ret = gwnet_tcp_srv_handle_accept(w);
 		break;
 	case GWNET_EPL_EV_EVENTFD:
 		ret = gwnet_tcp_srv_handle_eventfd(w);
@@ -855,6 +1019,24 @@ static int gwnet_tcp_srv_handle_events(int nr_events,
 				       struct gwnet_tcp_srv_wrk *w)
 {
 	int ret = 0, i;
+
+	if (w->id == 0) {
+		bool has_accept_event = false;
+
+		for (i = 0; i < nr_events; i++) {
+			struct epoll_event *ev = &w->events[i];
+			if (ev->data.u64 == GWNET_EPL_EV_ACCEPT) {
+				has_accept_event = true;
+				break;
+			}
+		}
+
+		if (has_accept_event) {
+			ret = gwnet_tcp_srv_handle_accept(w);
+			if (unlikely(ret))
+				return ret;
+		}
+	}
 
 	for (i = 0; i < nr_events; i++) {
 		struct epoll_event *ev = &w->events[i];
@@ -983,11 +1165,30 @@ void gwnet_tcp_srv_free(gwnet_tcp_srv_t *s)
 	gwnet_tcp_srv_free_socket(s);
 	gwnet_tcp_srv_free_client_bucket(s);
 	memset(s, 0, sizeof(*s));
+	free(s);
 }
 
 int gwnet_tcp_srv_run(gwnet_tcp_srv_t *srv)
 {
 	return (intptr_t)gwnet_tcp_srv_worker_thread(&srv->workers[0]);
+}
+
+void gwnet_tcp_srv_stop(gwnet_tcp_srv_t *s)
+{
+	uint16_t i;
+
+	if (!s)
+		return;
+
+	s->should_stop = true;
+	for (i = 0; i < s->nr_workers; i++)
+		gwnet_tcp_srv_ev_signal(&s->workers[i]);
+}
+
+void gwnet_tcp_srv_cli_set_pre_recv_cb(gwnet_tcp_cli_t *c,
+				       gwnet_tcp_cli_pre_recv_t cb)
+{
+	c->pre_recv_cb = cb;
 }
 
 void gwnet_tcp_srv_cli_set_post_recv_cb(gwnet_tcp_cli_t *c,
@@ -1016,7 +1217,7 @@ void gwnet_tcp_srv_cli_set_free_cb(gwnet_tcp_cli_t *c,
 
 void gwnet_tcp_srv_cli_set_data(gwnet_tcp_cli_t *c, void *data)
 {
-	c->data = data;
+	c->udata = data;
 }
 
 void gwnet_tcp_srv_set_accept_cb(gwnet_tcp_srv_t *s,
@@ -1027,12 +1228,26 @@ void gwnet_tcp_srv_set_accept_cb(gwnet_tcp_srv_t *s,
 	s->accept_cb_data = data;
 }
 
-struct gwbuf *gwnet_tcp_srv_cli_get_tx_buf(gwnet_tcp_cli_t *c)
+struct gwnet_tcp_buf *gwnet_tcp_srv_cli_get_tx_buf(gwnet_tcp_cli_t *c)
 {
 	return &c->tx_buf;
 }
 
-struct gwbuf *gwnet_tcp_srv_cli_get_rx_buf(gwnet_tcp_cli_t *c)
+struct gwnet_tcp_buf *gwnet_tcp_srv_cli_get_rx_buf(gwnet_tcp_cli_t *c)
 {
 	return &c->rx_buf;
+}
+
+void gwnet_tcp_srv_set_tcp_buf_rx(gwnet_tcp_cli_t *c,
+				  const struct gwnet_tcp_buf *buf)
+{
+	gwnet_tcp_buf_free(&c->rx_buf);
+	c->rx_buf = *buf;
+}
+
+void gwnet_tcp_srv_set_tcp_buf_tx(gwnet_tcp_cli_t *c,
+				  const  struct gwnet_tcp_buf *buf)
+{
+	gwnet_tcp_buf_free(&c->tx_buf);
+	c->tx_buf = *buf;
 }
