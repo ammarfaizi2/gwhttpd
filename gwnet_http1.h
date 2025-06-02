@@ -17,15 +17,17 @@ enum {
 };
 
 enum {
-	GWNET_HTTP_PARSE_STATE_INIT		= 0,
-	GWNET_HTTP_PARSE_STATE_HDR_FIRST_LINE	= 1,
-	GWNET_HTTP_PARSE_STATE_HDR_FIELDS	= 2,
-	GWNET_HTTP_PARSE_STATE_HDR_DONE		= 3,
+	GWNET_HTTP_HDR_PARSE_ST_INIT		= 0,
+	GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE	= 1,
+	GWNET_HTTP_HDR_PARSE_ST_FIELDS		= 2,
+	GWNET_HTTP_HDR_PARSE_ST_DONE		= 3,
 };
 
 enum {
-	GWNET_HTTP_PARSE_ERR_MALFORMED	= 1,
-	GWNET_HTTP_PARSE_ERR_TOO_LONG	= 2,
+	GWNET_HTTP_HDR_ERR_NONE		= 0,
+	GWNET_HTTP_HDR_ERR_MALFORMED	= 1,
+	GWNET_HTTP_HDR_ERR_TOO_LONG	= 2,
+	GWNET_HTTP_HDR_ERR_INTERNAL	= 100,
 };
 
 enum {
@@ -47,23 +49,14 @@ enum {
 	GWNET_HTTP_METHOD_CONNECT	= 9,
 };
 
-struct gwnet_http_parse_hdr_ctx {
-	uint8_t		state;
-	uint8_t		type;
-	uint32_t	buf_len;
-	uint32_t	off;
-	const char	*buf;
-	void		*udata;
-};
-
 struct gwnet_http_hdr_field {
-	char		*key;
-	char		*val;
+	char	*key;
+	char	*val;
 };
 
 struct gwnet_http_hdr_fields {
-	struct gwnet_http_hdr_field *fields;
-	size_t nr_fields;
+	struct gwnet_http_hdr_field	*ff;
+	size_t				nr;
 };
 
 struct gwnet_http_req_hdr {
@@ -78,40 +71,42 @@ struct gwnet_http_req_hdr {
 struct gwnet_http_res_hdr {
 	uint8_t		version;
 	uint16_t	code;
-	char		reason[64];
+	char		*reason;
+
 	struct gwnet_http_hdr_fields fields;
 };
 
-struct gwnet_http_hdr {
-	uint8_t		type;
-	union {
-		struct gwnet_http_req_hdr req;
-		struct gwnet_http_res_hdr res;
-	};
+struct gwnet_http_hdr_pctx {
+	uint8_t		state;
+	uint8_t		err;
+	uint32_t	off;
+	const char	*buf;
+	uint64_t	len;
+	uint64_t	max_len;
 };
 
-void gwnet_http_parse_header_init(struct gwnet_http_parse_hdr_ctx *ctx);
-int gwnet_http_parse_header(struct gwnet_http_parse_hdr_ctx *ctx,
-			    struct gwnet_http_hdr *hdr);
-int gwnet_http_parse_req_header(struct gwnet_http_parse_hdr_ctx *ctx,
-				struct gwnet_http_req_hdr *hdr);
-int gwnet_http_parse_res_header(struct gwnet_http_parse_hdr_ctx *ctx,
-				struct gwnet_http_res_hdr *hdr);
-void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *req);
-void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *res);
-void gwnet_http_hdr_free(struct gwnet_http_hdr *hdr);
-int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *hdrf,
-			      const char *key, size_t key_len, const char *val,
-			      size_t val_len);
-int gwnet_http_hdr_fields_fadd(struct gwnet_http_hdr_fields *hdrf,
-			       const char *key, const char *fmt, ...);
-int gwnet_http_hdr_fields_sadd(struct gwnet_http_hdr_fields *hdrf,
-			       const char *key, const char *val);
-const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *hdrf,
-				      const char *key, size_t key_len);
-const char *gwnet_http_hdr_fields_sget(const struct gwnet_http_hdr_fields *hdrf,
-				       const char *key);
-void gwnet_http_req_hdr_fields_free(struct gwnet_http_hdr_fields *hdrf);
-void gwnet_http_run_tests(void);
+int gwnet_http_hdr_pctx_init(struct gwnet_http_hdr_pctx *ctx);
+void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
+int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+			     struct gwnet_http_req_hdr *hdr);
+int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+			     struct gwnet_http_res_hdr *hdr);
+void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr);
+void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
+
+void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
+int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
+			      const char *v);
+__attribute__((__format__(printf, 3, 4)))
+int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
+			       const char *k, const char *fmt, ...);
+int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
+			       const char *k, size_t klen,
+			       const char *v, size_t vlen);
+
+const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
+				      const char *k);
+const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
+				       const char *k, size_t klen);
 
 #endif /* #ifndef GWNET_HTTP1_H */
