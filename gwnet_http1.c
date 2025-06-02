@@ -39,7 +39,7 @@ struct gwnet_http_parse_hdr_cb {
 	void (*on_error)(void *u, int err);
 };
 
-static bool gwnet_http_field_is_comma_separated(const char *key, size_t n)
+static bool field_is_comma_separated(const char *key, size_t n)
 {
 	static const char *comma_separated_list_headers[] = {
 		/* RFC 7231, Section 5.3.2 */
@@ -171,76 +171,75 @@ int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *hdrf,
 			      size_t val_len)
 {
 	ssize_t idx = gwnet_http_hdr_fields_find_idx(hdrf, key, key_len);
-	if (idx >= 0) {
-		struct gwnet_http_hdr_field *f = &hdrf->fields[idx];
-		size_t clen = strlen(f->val);
-		char *new_val;
-		int ret;
+	struct gwnet_http_hdr_field *f;
+	char *new_val;
+	int ret;
 
-		if (gwnet_http_field_is_comma_separated(key, key_len)) {
-			size_t len = clen + val_len + 3;
-			new_val = realloc(f->val, len);
-			if (unlikely(!new_val))
-				return -ENOMEM;
-
-			if (!clen) {
-				memcpy(new_val, val, val_len);
-				new_val[val_len] = '\0';
-			} else {
-				memcpy(&new_val[clen], ", ", 2);
-				memcpy(&new_val[clen + 2], val, val_len);
-				new_val[len - 1] = '\0';
-			}
-			ret = 0;
-		} else {
-			new_val = realloc(f->val, val_len + 1);
-			if (unlikely(!new_val))
-				return -ENOMEM;
-
-			memcpy(new_val, val, val_len);
-			new_val[val_len] = '\0';
-
-			/*
-			 * Allow overwrite, but notify the caller with EEXIST.
-			 */
-			ret = EEXIST;
-		}
-
-		f->val = new_val;
-		return ret;
-	} else {
+	if (likely(idx < 0)) {
 		struct gwnet_http_hdr_field *new_fields;
 		size_t new_size;
 		char *k, *v;
 
 		k = malloc(key_len + 1);
-		if (unlikely(!k))
+		if (!k)
 			return -ENOMEM;
-		memcpy(k, key, key_len);
-		k[key_len] = '\0';
 
 		v = malloc(val_len + 1);
-		if (unlikely(!v)) {
+		if (!v) {
 			free(k);
 			return -ENOMEM;
 		}
-		memcpy(v, val, val_len);
-		v[val_len] = '\0';
 
 		new_size = (hdrf->nr_fields + 1) * sizeof(*hdrf->fields);
 		new_fields = realloc(hdrf->fields, new_size);
-		if (unlikely(!new_fields)) {
+		if (!new_fields) {
 			free(k);
 			free(v);
 			return -ENOMEM;
 		}
 
+		memcpy(k, key, key_len);
+		memcpy(v, val, val_len);
+		k[key_len] = '\0';
+		v[val_len] = '\0';
 		hdrf->fields = new_fields;
-		hdrf->fields[hdrf->nr_fields].key = k;
-		hdrf->fields[hdrf->nr_fields].val = v;
-		hdrf->nr_fields++;
+		f = &hdrf->fields[hdrf->nr_fields++];
+		f->key = k;
+		f->val = v;
 		return 0;
 	}
+
+
+	f = &hdrf->fields[idx];
+	if (field_is_comma_separated(key, key_len)) {
+		size_t cur_len = strlen(f->val);
+		size_t new_val_len = cur_len + val_len + 3;
+
+		new_val = realloc(f->val, new_val_len);
+		if (!new_val)
+			return -ENOMEM;
+
+		if (!cur_len) {
+			memcpy(new_val, val, val_len);
+			new_val[val_len] = '\0';
+		} else {
+			memcpy(&new_val[cur_len], ", ", 2);
+			memcpy(&new_val[cur_len + 2], val, val_len);
+			new_val[new_val_len - 1] = '\0';
+		}
+
+		f->val = new_val;
+		return 0;
+	}
+
+	new_val = realloc(f->val, val_len + 1);
+	if (!new_val)
+		return -ENOMEM;
+
+	memcpy(new_val, val, val_len);
+	new_val[val_len] = '\0';
+	f->val = new_val;
+	return 0;
 }
 
 int gwnet_http_hdr_fields_fadd(struct gwnet_http_hdr_fields *hdrf,
@@ -256,7 +255,7 @@ int gwnet_http_hdr_fields_fadd(struct gwnet_http_hdr_fields *hdrf,
 	va_end(args1);
 
 	val = malloc(ret + 1);
-	if (unlikely(!val)) {
+	if (!val) {
 		va_end(args2);
 		return -ENOMEM;
 	}
