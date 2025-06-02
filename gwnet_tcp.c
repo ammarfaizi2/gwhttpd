@@ -832,7 +832,7 @@ static int gwnet_tcp_buf_get_tx_ptrnlen(struct gwnet_tcp_cli *c,
 	return -EINVAL;
 }
 
-static int gwnet_tcp_buf_adv_tx(struct gwnet_tcp_cli *c, ssize_t len)
+static ssize_t gwnet_tcp_buf_adv_tx(struct gwnet_tcp_cli *c, ssize_t len)
 {
 	struct gwnet_tcp_buf *b = &c->tx_buf;
 	int ret;
@@ -846,7 +846,7 @@ static int gwnet_tcp_buf_adv_tx(struct gwnet_tcp_cli *c, ssize_t len)
 			return ret;
 	}
 
-	return 0;
+	return len;
 }
 
 static ssize_t gwnet_tcp_srv_do_recv(struct gwnet_tcp_cli *c)
@@ -878,6 +878,7 @@ static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 	ssize_t ret;
 	size_t len;
 	void *buf;
+	int r;
 
 	ret = gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &len, true);
 	if (ret < 0)
@@ -893,8 +894,7 @@ static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 	if (!ret)
 		return -ECONNRESET;
 
-	gwnet_tcp_buf_adv_tx(c, ret);
-	return ret;
+	return gwnet_tcp_buf_adv_tx(c, ret);
 }
 
 static int gwnet_tcp_srv_handle_client_in(struct gwnet_tcp_srv_wrk *w,
