@@ -70,21 +70,17 @@ static inline int is_vchar(int c)
 }
 
 /**
- * Checks if the given HTTP header field key is one of the standard headers
- * that are allowed to appear multiple times in a message and should be
- * merged into a single comma-separated header value according to the HTTP
- * specification.
- *
- * This is used to determine whether the parser should combine multiple
- * occurrences of the specified header field into a single comma-separated
- * value.
+ * Check if the given HTTP header field key is one of the standard
+ * headers that are allowed to appear multiple times in a message and
+ * should be merged into a single comma-separated header value
+ * according to the HTTP specification.
  *
  * @param key The header field name to check (case-insensitive).
  * @param n   The length of the header field name.
- * @return    true if the header is allowed to be provided multiple times and
- *            should be merged; false otherwise.
+ * @return    true if the header is allowed to be provided multiple
+ *            times and should be merged; false otherwise.
  */
-static bool field_is_comma_separated(const char *key, size_t n)
+static bool is_field_allowed_to_be_duplicate(const char *key, size_t n)
 {
 	static const char *comma_separated_list_headers[] = {
 		/* RFC 7231, Section 5.3.2 */
@@ -146,11 +142,35 @@ static bool field_is_comma_separated(const char *key, size_t n)
 	return false;
 }
 
+
+/**
+ * Parse the first line of an HTTP/1.x request header, also known as
+ * the request line. According to RFC 9112, Section 3.1.1, the request
+ * line consists of the method, request-target, and HTTP version,
+ * separated by spaces and terminated by CRLF.
+ *
+ * Example:
+ *   GET /index.html HTTP/1.1\r\n
+ *
+ * It extracts and validates these components from the provided parsing
+ * context and stores them in the request header structure.
+ *
+ * Reference:
+ *   RFC 9112, Section 3:
+ *   https://datatracker.ietf.org/doc/html/rfc9112#section-3
+ *
+ * @param ctx  Pointer to the HTTP header parsing context.
+ * @param hdr  Pointer to the HTTP request header structure to populate.
+ * @return     0 on success,
+ *             -EAGAIN if more data is needed,
+ *             -EINVAL if the request line is malformed,
+ *             -ENOMEM if memory allocation fails.
+ */
 static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_req_hdr *hdr)
 {
 	struct method_entry {
-		const char *str;
+		const char str[9];
 		uint8_t len;
 		uint8_t code;
 	};
@@ -313,7 +333,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (!hdr->uri)
 		return -ENOMEM;
 
-	if (qs) {
+	if (qs_len) {
 		hdr->qs = malloc(qs_len + 1);
 		if (!hdr->qs) {
 			free(hdr->uri);
@@ -332,6 +352,30 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	return 0;
 }
 
+/**
+ * Parse the first line of an HTTP/1.x response header, also known as
+ * the status line. According to RFC 7230 Section 3.1.2, the status
+ * line is formatted as: HTTP-version SP status-code SP reason-phrase
+ * CRLF.
+ *
+ * Example:
+ *   HTTP/1.1 200 OK\r\n
+ *
+ * It extracts the HTTP version, status code, and reason phrase from
+ * the response header's first line and populates the provided
+ * response header structure.
+ *
+ * Reference:
+ *   RFC 7230, Section 3.1.2:
+ *   https://datatracker.ietf.org/doc/html/rfc7230#section-3.1.2
+ *
+ * @param ctx Pointer to the HTTP header parsing context.
+ * @param hdr Pointer to the HTTP response header structure to populate.
+ * @return    0 on success,
+ *            -EAGAIN if more data is needed,
+ *            -EINVAL if the first line is malformed,
+ *            -ENOMEM if memory allocation fails.
+ */
 static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_res_hdr *hdr)
 {
@@ -481,6 +525,25 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	return 0;
 }
 
+/**
+ * Parses HTTP header fields from the provided parsing context.
+ *
+ * According to RFC 7230, Section 3.2: "Each header field consists of a
+ * case-insensitive field name followed by a colon (":"), optional
+ * whitespace, and the field value." This function processes the header
+ * fields as described in the RFC.
+ *
+ * Reference: RFC 7230, Section 3.2 - Header Fields
+ * https://datatracker.ietf.org/doc/html/rfc7230#section-3.2
+ *
+ * @param ctx Pointer to the HTTP header parsing context.
+ * @param ff  Pointer to the structure where parsed header fields will be
+ *            stored.
+ * @return    0 on success,
+ *            -EAGAIN if more data is needed,
+ *            -EINVAL if the header fields are malformed,
+ *            -ENOMEM if memory allocation fails.
+ */
 static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			    struct gwnet_http_hdr_fields *ff)
 {
@@ -585,7 +648,7 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 
 		r = gwnet_http_hdr_fields_addl(ff, k, kl, v, vl);
 		if (r)
-			return r;
+			return (r < 0) ? r : -EINVAL;
 
 		ctx->off += off;
 		if (off >= len)
@@ -611,13 +674,15 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx)
 	memset(ctx, 0, sizeof(*ctx));
 }
 
-int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
-			     struct gwnet_http_req_hdr *hdr)
+static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+				      struct gwnet_http_req_hdr *hdr)
 {
 	int r = 0;
 
-	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_INIT)
+	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE;
+		memset(hdr, 0, sizeof(*hdr));
+	}
 
 	if (!ctx->len)
 		return -EAGAIN;
@@ -639,8 +704,8 @@ int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	return r;
 }
 
-int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
-			     struct gwnet_http_res_hdr *hdr)
+static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+				      struct gwnet_http_res_hdr *hdr)
 {
 	int r = 0;
 
@@ -667,6 +732,43 @@ int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	}
 
 	return r;
+}
+
+static int translate_err(struct gwnet_http_hdr_pctx *ctx, int r)
+{
+	switch (r) {
+	case -EAGAIN:
+		ctx->err = GWNET_HTTP_HDR_ERR_NONE;
+		break;
+	case -EINVAL:
+		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
+		break;
+	default:
+		ctx->err = GWNET_HTTP_HDR_ERR_INTERNAL;
+		break;
+	}
+
+	return r;
+}
+
+int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+			     struct gwnet_http_req_hdr *hdr)
+{
+	int r = __gwnet_http_req_hdr_parse(ctx, hdr);
+	if (!r)
+		return r;
+
+	return translate_err(ctx, r);
+}
+
+int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
+			     struct gwnet_http_res_hdr *hdr)
+{
+	int r = __gwnet_http_res_hdr_parse(ctx, hdr);
+	if (!r)
+		return r;
+
+	return translate_err(ctx, r);
 }
 
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
@@ -766,8 +868,8 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 
 	if (idx < 0) {
 		struct gwnet_http_hdr_field *new_fields;
-		char *kc, *vc;
 		size_t new_size;
+		char *kc, *vc;
 
 		kc = malloc(klen + 1);
 		if (!kc)
@@ -799,10 +901,14 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 	}
 
 	f = &ff->ff[idx];
-	if (field_is_comma_separated(k, klen)) {
-		size_t cur_len = strlen(f->val);
-		size_t new_val_len = cur_len + vlen + 3;
+	if (is_field_allowed_to_be_duplicate(k, klen)) {
+		size_t cur_len, new_val_len;
 
+		if (!vlen)
+			return 0;
+
+		cur_len = strlen(f->val);
+		new_val_len = cur_len + vlen + 3;
 		new_val = realloc(f->val, new_val_len);
 		if (!new_val)
 			return -ENOMEM;
@@ -818,26 +924,22 @@ int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 
 		f->val = new_val;
 		return 0;
+	} else {
+		new_val = realloc(f->val, vlen + 1);
+		if (!new_val)
+			return -ENOMEM;
+
+		memcpy(new_val, v, vlen);
+		new_val[vlen] = '\0';
+		f->val = new_val;
+		return EEXIST;
 	}
-
-	new_val = realloc(f->val, vlen + 1);
-	if (!new_val)
-		return -ENOMEM;
-
-	memcpy(new_val, v, vlen);
-	new_val[vlen] = '\0';
-	f->val = new_val;
-	return 0;
 }
 
 const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
 				      const char *k)
 {
-	ssize_t idx = find_hdr_field_idx(ff, k, strlen(k));
-	if (idx < 0)
-		return NULL;
-
-	return ff->ff[idx].val;
+	return gwnet_http_hdr_fields_getl(ff, k, strlen(k));
 }
 
 const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
@@ -850,9 +952,182 @@ const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 	return ff->ff[idx].val;
 }
 
-#define PRTEST_OK()				\
-do {						\
-	printf("Test passed: %s\n", __func__);	\
+int gwnet_http_body_pctx_init(struct gwnet_http_body_pctx *ctx)
+{
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->state = GWNET_HTTP_BODY_PARSE_ST_INIT;
+	return 0;
+}
+
+void gwnet_http_body_pctx_free(struct gwnet_http_body_pctx *ctx)
+{
+	memset(ctx, 0, sizeof(*ctx));
+}
+
+static int is_xdigit(int c)
+{
+	if (c >= '0' && c <= '9')
+		return 1;
+	if (c >= 'A' && c <= 'F')
+		return 1;
+	if (c >= 'a' && c <= 'f')
+		return 1;
+	return 0;
+}
+
+static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
+{
+	size_t len = ctx->len - ctx->off, off = 0, i = 0;
+	const char *buf = &ctx->buf[ctx->off];
+	uint64_t decoded_len = 0;
+	char tmp_buf[17], *e;
+
+	while (1) {
+		char c = buf[off];
+
+		if (i >= 16)
+			return -EINVAL;
+
+		if (off >= len)
+			return -EAGAIN;
+
+		if (!is_xdigit(c))
+			break;
+
+		tmp_buf[i++] = c;
+		off++;
+	}
+
+	if (buf[off] != '\r')
+		return -EINVAL;
+	if (++off >= len)
+		return -EAGAIN;
+
+	if (buf[off] != '\n')
+		return -EINVAL;
+	if (++off >= len)
+		return -EAGAIN;
+
+	tmp_buf[i] = '\0';
+	errno = 0;
+	decoded_len = strtoull(tmp_buf, &e, 16);
+	if (errno || e == tmp_buf || *e != '\0')
+		return -EINVAL;
+
+	ctx->off += off;
+	ctx->rem_len = decoded_len;
+
+	if (decoded_len) {
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_DATA;
+		ctx->found_zero_len = false;
+	} else {
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_TR;
+		ctx->found_zero_len = true;
+	}
+
+	return 0;
+}
+
+static int parse_chunked_data(struct gwnet_http_body_pctx *ctx, char **dst_p,
+			      size_t *dst_len_p)
+{
+	size_t len = ctx->len - ctx->off, copy_len;
+	const char *buf = &ctx->buf[ctx->off];
+
+	copy_len = min_st(ctx->rem_len, len);
+
+	if (dst_len_p)
+		copy_len = min_st(copy_len, *dst_len_p);
+
+	if (!copy_len)
+		return -ENOBUFS;
+
+	if (*dst_p) {
+		memcpy(*dst_p, buf, copy_len);
+		*dst_len_p -= copy_len;
+		*dst_p += copy_len;
+	}
+
+	ctx->off += copy_len;
+	ctx->tot_len += copy_len;
+	ctx->rem_len -= copy_len;
+
+	if (!ctx->rem_len)
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_TR;
+
+	return 0;
+}
+
+static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
+{
+	size_t len = ctx->len - ctx->off, cmpl;
+	const char *buf = &ctx->buf[ctx->off];
+
+	cmpl = min_st(len, 2);
+	if (memcmp(buf, "\r\n", cmpl))
+		return -EINVAL;
+	if (cmpl < 2)
+		return -EAGAIN;
+
+	ctx->off += 2;
+	if (ctx->found_zero_len)
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_DONE;
+	else 
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
+
+	return 0;
+}
+
+int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
+				  char *dst, size_t dst_len)
+{
+	size_t dst_len_loc = dst_len;
+	size_t *dst_len_p = dst_len_loc ? &dst_len_loc : NULL;
+	int r = 0;
+
+	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT)
+		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
+
+	if (!ctx->len)
+		return -EAGAIN;
+
+	while (1) {
+		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_LEN) {
+			r = parse_chunked_len(ctx);
+			if (r)
+				break;
+		}
+
+		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA) {
+			r = parse_chunked_data(ctx, &dst, dst_len_p);
+			if (r)
+				break;
+		}
+
+		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_TR) {
+			r = parse_chunked_tr(ctx);
+			if (r)
+				break;
+		}
+
+		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE) {
+			r = 0;
+			break;
+		}
+	}
+
+	return r;
+}
+
+#ifdef GWNET_HTTP1_TESTS
+
+#define PRTEST_OK()					\
+do {							\
+	static bool __printed;				\
+	if (!__printed) {				\
+		printf("Test passed: %s\n", __func__);	\
+		__printed = true;			\
+	}						\
 } while (0)
 
 #define ASSERT_HDRF(f, k, v)			\
@@ -864,7 +1139,7 @@ do {						\
 static void test_req_hdr_simple(void)
 {
 	static const char buf[] =
-		"GET /index.html?q=1&a=b HTTP/1.1\r\n"
+		"GET /index.html HTTP/1.0\r\n"
 		"Host: example.com\r\n"
 		"User-Agent: gwhttp\r\n"
 		"Accept: */*\r\n"
@@ -884,9 +1159,9 @@ static void test_req_hdr_simple(void)
 	assert(ctx.off == len);
 	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
 	assert(hdr.method == GWNET_HTTP_METHOD_GET);
-	assert(hdr.version == GWNET_HTTP_VER_1_1);
-	assert(!strcmp(hdr.uri, "/index.html?q=1&a=b"));
-	assert(!strcmp(hdr.qs, "q=1&a=b"));
+	assert(hdr.version == GWNET_HTTP_VER_1_0);
+	assert(!strcmp(hdr.uri, "/index.html"));
+	assert(!hdr.qs);
 	assert(hdr.fields.nr == 4);
 	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
 	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
@@ -900,7 +1175,7 @@ static void test_req_hdr_simple(void)
 static void test_res_hdr_simple(void)
 {
 	static const char buf[] =
-		"HTTP/1.1 200 OK\r\n"
+		"HTTP/1.0 200 OK\r\n"
 		"Server: gwhttpd\r\n"
 		"Date: Mon, 01 Jan 1999 00:00:00 GMT\r\n"
 		"Content-Type: text/html; charset=UTF-8\r\n"
@@ -920,6 +1195,10 @@ static void test_res_hdr_simple(void)
 	assert(!r);
 	assert(ctx.off == len);
 	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(hdr.code == 200);
+	assert(!strcmp(hdr.reason, "OK"));
+	assert(hdr.version == GWNET_HTTP_VER_1_0);
 	assert(hdr.fields.nr == 5);
 	ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd");
 	ASSERT_HDRF(&hdr.fields.ff[1], "Date", "Mon, 01 Jan 1999 00:00:00 GMT");
@@ -931,10 +1210,827 @@ static void test_res_hdr_simple(void)
 	PRTEST_OK();
 }
 
-// int main(void)
-// {
-// 	test_req_hdr_simple();
-// 	test_res_hdr_simple();
-// 	printf("All tests passed!\n");
-// 	return 0;
-// }
+static void test_req_hdr_query_string(void)
+{
+	static const char buf[] =
+		"GET /index.html?foo=bar&baz=qux HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!strcmp(hdr.uri, "/index.html?foo=bar&baz=qux"));
+	assert(!strcmp(hdr.qs, "foo=bar&baz=qux"));
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_query_string_empty(void)
+{
+	static const char buf[] =
+		"GET /index.html? HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!strcmp(hdr.uri, "/index.html?"));
+	assert(!hdr.qs);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_uri_chars(void)
+{
+	static const char buf[] =
+		"GET AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_uri_chars2(void)
+{
+	static const char buf[] =
+		"GET /\0\1\2\3\4\5\6\7 HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Invalid-Header: \r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_method(void)
+{
+	static const char buf[] =
+		"INVALID /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_version(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/2.0\r\n"
+		"Host: example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_invalid_version(void)
+{
+	static const char buf[] =
+		"HTTP/2.0 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_trim_whitespaces(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host:\t\t\t\t\t\t\t\t\texample.com\t\t\t\t\t\t\r\n"
+		"User-Agent:        gwhttp \t \t \t \r\n"
+		"Accept:*/*    \t\t\t          \t\r\n"
+		"Connection: \t\t\t  \t\tkeep-alive\t\t \t \r\n"
+		"X-Test-A:AAAA\r\n"
+		"X-Test-B:      BBBB\r\n"
+		"X-Test-C:CCCC     \t\t\t\t   \r\n"
+		"X-Test-D: DDDD   \r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!strcmp(hdr.uri, "/index.html"));
+	assert(!hdr.qs);
+	assert(hdr.fields.nr == 8);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
+	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Accept", "*/*");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Connection", "keep-alive");
+	ASSERT_HDRF(&hdr.fields.ff[4], "X-Test-A", "AAAA");
+	ASSERT_HDRF(&hdr.fields.ff[5], "X-Test-B", "BBBB");
+	ASSERT_HDRF(&hdr.fields.ff[6], "X-Test-C", "CCCC");
+	ASSERT_HDRF(&hdr.fields.ff[7], "X-Test-D", "DDDD");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_trim_whitespaces(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: \t\t\t\t\t\tgwhttpd\r\n"
+		"Date: \t\t\t\tMon, 01 Jan 1999 00:00:00 GMT\r\n"
+		"Content-Type: \ttext/html; charset=UTF-8\r\n"
+		"Content-Length: \t1234\r\n"
+		"Connection: \tclose\r\n"
+		"X-Test-A:AAAA\r\n"
+		"X-Test-B:      BBBB\r\n"
+		"X-Test-C:CCCC     \r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(hdr.code == 200);
+	assert(!strcmp(hdr.reason, "OK"));
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(hdr.fields.nr == 8);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd");
+	ASSERT_HDRF(&hdr.fields.ff[1], "Date", "Mon, 01 Jan 1999 00:00:00 GMT");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Content-Type", "text/html; charset=UTF-8");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Content-Length", "1234");
+	ASSERT_HDRF(&hdr.fields.ff[4], "Connection", "close");
+	ASSERT_HDRF(&hdr.fields.ff[5], "X-Test-A", "AAAA");
+	ASSERT_HDRF(&hdr.fields.ff[6], "X-Test-B", "BBBB");
+	ASSERT_HDRF(&hdr.fields.ff[7], "X-Test-C", "CCCC");
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_duplicate_fields(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Host: example.org\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_invalid_duplicate_fields(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"Server: gwhttpd2\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_space_before_colon(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host : example.com\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_invalid_space_before_colon(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server : gwhttpd\r\n"
+		"Date    : Mon, 01 Jan 1999 00:00:00 GMT\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_duplicate_fields_merged_into_comma(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com, example.org\r\n"
+		"User-Agent: gwhttp\r\n"
+		"Accept: application/json\r\n"
+		"Accept: text/html\r\n"
+		"Accept: plain/text\r\n"
+		"Connection: keep-alive\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!strcmp(hdr.uri, "/index.html"));
+	assert(!hdr.qs);
+	assert(hdr.fields.nr == 4);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com, example.org");
+	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Accept", "application/json, text/html, plain/text");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Connection", "keep-alive");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_duplicate_fields_merged_into_comma(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd, gwhttpd2\r\n"
+		"Date: Mon, 01 Jan 1999 00:00:00 GMT\r\n"
+		"Content-Type: text/html; charset=UTF-8\r\n"
+		"Transfer-Encoding: gzip\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Content-Length: 1234\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(hdr.code == 200);
+	assert(!strcmp(hdr.reason, "OK"));
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(hdr.fields.nr == 6);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd, gwhttpd2");
+	ASSERT_HDRF(&hdr.fields.ff[1], "Date", "Mon, 01 Jan 1999 00:00:00 GMT");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Content-Type", "text/html; charset=UTF-8");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Transfer-Encoding", "gzip, chunked");
+	ASSERT_HDRF(&hdr.fields.ff[4], "Content-Length", "1234");
+	ASSERT_HDRF(&hdr.fields.ff[5], "Connection", "close");
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_duplicate_fields_empty_value(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"User-Agent: \r\n"
+		"Accept: \r\n"
+		"Accept:   \r\n"
+		"Accept: text/html\r\n"
+		"Accept:     \r\n"
+		"Accept:     \r\n"
+		"Accept: application/json\r\n"
+		"Accept:     \r\n"
+		"Accept:     \r\n"
+		"Accept: plain/text\r\n"
+		"Connection: keep-alive\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!strcmp(hdr.uri, "/index.html"));
+	assert(!hdr.qs);
+	assert(hdr.fields.nr == 4);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
+	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent","");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Accept", "text/html, application/json, plain/text");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Connection", "keep-alive");
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_duplicate_fields_empty_value(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"Date: \r\n"
+		"Content-Type: text/html; charset=UTF-8\r\n"
+		"Transfer-Encoding: \r\n"
+		"Transfer-Encoding: gzip\r\n"
+		"Transfer-Encoding: chunked\r\n"
+		"Content-Length: 1234\r\n"
+		"Connection: close\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.off == len);
+	assert(ctx.state == GWNET_HTTP_HDR_PARSE_ST_DONE);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(hdr.code == 200);
+	assert(!strcmp(hdr.reason, "OK"));
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(hdr.fields.nr == 6);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd");
+	ASSERT_HDRF(&hdr.fields.ff[1], "Date", "");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Content-Type", "text/html; charset=UTF-8");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Transfer-Encoding", "gzip, chunked");
+	ASSERT_HDRF(&hdr.fields.ff[4], "Content-Length", "1234");
+	ASSERT_HDRF(&hdr.fields.ff[5], "Connection", "close");
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_field_val_chars(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Invalid-Header: \x01\x02\x03\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_invalid_field_val_chars(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"Invalid-Header: \x01\x02\x03\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_field_key_chars(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"Invalid-Header\x01\x02\x03: value\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_invalid_field_key_chars(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"Invalid-Header\x01\x02\x03: value\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_MALFORMED);
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_body_chunked_simple(void)
+{
+	const char buf[] =
+		"5\r\n"
+		"Hello\r\n"
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_body_parse_chunked(&ctx, NULL, 0);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == strlen("Hello"));
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_body_chunked_multiple_chunks(void)
+{
+	const char buf[] =
+		"5\r\n"
+		"Hello\r\n"
+		"6\r\n"
+		" World\r\n"
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	char dst[sizeof(buf)] = { 0 };
+	size_t dst_len = sizeof(dst);
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == strlen("Hello World"));
+	assert(!strcmp(dst, "Hello World"));
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_body_chunked_empty(void)
+{
+	const char buf[] =
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_body_parse_chunked(&ctx, NULL, 0);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == 0);
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_body_chunked_multiple_various_lengths(void)
+{
+	const char buf[] =
+		"a\r\n"
+		"1234567890\r\n"
+		"5\r\n"
+		"Hello\r\n"
+		"a\r\n"
+		"ABCDEFGHIJ\r\n"
+		"5\r\n"
+		"World\r\n"
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	char dst[sizeof(buf)] = { 0 };
+	size_t dst_len = sizeof(dst) - 1;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == strlen("1234567890HelloABCDEFGHIJWorld"));
+	assert(!strcmp(dst, "1234567890HelloABCDEFGHIJWorld"));
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_body_chunked_dst_buffer_too_small(void)
+{
+	const char buf[] =
+		"5\r\n"
+		"Hello\r\n"
+		"6\r\n"
+		" World\r\n"
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	char dst[3] = { 0 };
+	size_t dst_len = sizeof(dst) - 1;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(r == -ENOBUFS);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
+	assert(ctx.tot_len == 2);
+	assert(!strcmp(dst, "He"));
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(r == -ENOBUFS);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
+	assert(ctx.tot_len == 4);
+	assert(!strcmp(dst, "ll"));
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(r == -ENOBUFS);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
+	assert(ctx.tot_len == 6);
+	assert(!strcmp(dst, "o "));
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(r == -ENOBUFS);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
+	assert(ctx.tot_len == 8);
+	assert(!strcmp(dst, "Wo"));
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(r == -ENOBUFS);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
+	assert(ctx.tot_len == 10);
+	assert(!strcmp(dst, "rl"));
+
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == 11);
+	assert(dst[0] == 'd');
+
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+int main(void)
+{
+	size_t i;
+
+	for (i = 0; i < 1000; i++) {
+		test_req_hdr_simple();
+		test_res_hdr_simple();
+		test_req_hdr_query_string();
+		test_req_hdr_query_string_empty();
+		test_req_hdr_invalid_uri_chars();
+		test_req_hdr_invalid_uri_chars2();
+		test_req_hdr_invalid_method();
+		test_req_hdr_invalid_version();
+		test_res_hdr_invalid_version();
+		test_req_hdr_trim_whitespaces();
+		test_res_hdr_trim_whitespaces();
+		test_req_hdr_invalid_duplicate_fields();
+		test_res_hdr_invalid_duplicate_fields();
+		test_req_hdr_invalid_space_before_colon();
+		test_res_hdr_invalid_space_before_colon();
+		test_req_hdr_duplicate_fields_merged_into_comma();
+		test_res_hdr_duplicate_fields_merged_into_comma();
+		test_req_hdr_duplicate_fields_empty_value();
+		test_res_hdr_duplicate_fields_empty_value();
+		test_req_hdr_invalid_field_val_chars();
+		test_res_hdr_invalid_field_val_chars();
+		test_req_hdr_invalid_field_key_chars();
+		test_res_hdr_invalid_field_key_chars();
+		test_body_chunked_simple();
+		test_body_chunked_multiple_chunks();
+		test_body_chunked_empty();
+		test_body_chunked_multiple_various_lengths();
+		test_body_chunked_dst_buffer_too_small();
+	}
+	printf("All tests passed!\n");
+	return 0;
+}
+#endif /* #ifdef GWNET_HTTP1_TESTS */

@@ -96,7 +96,7 @@ int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 	va_end(args2);
 
 	ret = gwbuf_increase(b, len + 1);
-	if (ret < 0)	
+	if (ret < 0)
 		goto out;
 
 	ret = vsnprintf(b->buf + b->len, b->cap - b->len + 1, fmt, args);

@@ -79,34 +79,171 @@ struct gwnet_http_res_hdr {
 struct gwnet_http_hdr_pctx {
 	uint8_t		state;
 	uint8_t		err;
-	uint32_t	off;
 	const char	*buf;
+	uint64_t	off;
 	uint64_t	len;
 	uint64_t	max_len;
 };
 
+enum {
+	GWNET_HTTP_BODY_PARSE_ST_INIT		= 0,
+	GWNET_HTTP_BODY_PARSE_ST_CHK_LEN	= 1,
+	GWNET_HTTP_BODY_PARSE_ST_CHK_DATA	= 2,
+	GWNET_HTTP_BODY_PARSE_ST_CHK_TR		= 3,
+	GWNET_HTTP_BODY_PARSE_ST_CHK_DONE	= 4,
+};
+
+struct gwnet_http_body_pctx {
+	uint8_t		state;
+	bool		found_zero_len;
+	const char	*buf;
+	uint64_t	off;
+	uint64_t	len;
+	uint64_t	rem_len;
+	uint64_t	tot_len;
+	uint64_t	max_len;
+};
+
+/**
+ * Initialize the HTTP header parsing context.
+ *
+ * Prepare the given gwnet_http_hdr_pctx structure for use in HTTP
+ * header parsing operations.
+ *
+ * @param ctx Pointer to a gwnet_http_hdr_pctx structure to initialize.
+ *            Must not be NULL.
+ * @return 0 on success, or a negative value on failure.
+ */
 int gwnet_http_hdr_pctx_init(struct gwnet_http_hdr_pctx *ctx);
+
+/**
+ * Free resources associated with the HTTP header parsing context.
+ *
+ * This function releases any memory or resources held by the specified
+ * gwnet_http_hdr_pctx structure. After calling this function, the context
+ * should not be used unless re-initialized.
+ *
+ * @param ctx Pointer to a gwnet_http_hdr_pctx structure to free.
+ *            Must not be NULL.
+ */
 void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx);
+
+/**
+ * Parses an HTTP request header from the given parsing context.
+ *
+ * @param ctx  Pointer to the HTTP header parsing context.
+ * @param hdr  Pointer to the structure where the parsed HTTP request
+ *             header will be stored.
+ * @return     0 on success,
+ *             -EAGAIN if more data is needed,
+ *             -EINVAL if the request line is malformed,
+ *             -ENOMEM if memory allocation fails.
+ */
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_req_hdr *hdr);
+
+/**
+ * Parses an HTTP response header from the given parsing context.
+ *
+ * @param ctx  Pointer to the HTTP header parsing context.
+ * @param hdr  Pointer to the structure where the parsed HTTP response
+ *             header will be stored.
+ * @return     0 on success,
+ *             -EAGAIN if more data is needed,
+ *             -EINVAL if the response line is malformed,
+ *             -ENOMEM if memory allocation fails.
+ */
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr);
+
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr);
 void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr);
 
+/**
+ * Free all memory associated with the given HTTP header fields
+ * structure.
+ *
+ * @param ff Pointer to the HTTP header fields structure to free.
+ */
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff);
+
+/**
+ * Add a header field with the specified key and value to the HTTP
+ * header fields structure.
+ *
+ * @param ff Pointer to the HTTP header fields structure.
+ * @param k  Null-terminated string containing the header key.
+ * @param v  Null-terminated string containing the header value.
+ * @return   0 on success, or a negative value on error.
+ */
 int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
 			      const char *v);
+
+/**
+ * Add a header field with the specified key and a formatted value to
+ * the HTTP header fields structure.
+ *
+ * @param ff  Pointer to the HTTP header fields structure.
+ * @param k   Null-terminated string containing the header key.
+ * @param fmt printf-style format string for the header value.
+ * @param ... Arguments for the format string.
+ * @return    0 on success, or a negative value on error.
+ */
 __attribute__((__format__(printf, 3, 4)))
 int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
 			       const char *k, const char *fmt, ...);
-int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
-			       const char *k, size_t klen,
-			       const char *v, size_t vlen);
 
+/**
+ * Add a header field with the specified key and value, using explicit
+ * lengths for both key and value.
+ *
+ * @param ff   Pointer to the HTTP header fields structure.
+ * @param k    Pointer to the header key.
+ * @param klen Length of the header key.
+ * @param v    Pointer to the header value.
+ * @param vlen Length of the header value.
+ * @return     0 on success, or a negative value on error.
+ */
+int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
+			       const char *k, size_t klen, const char *v,
+			       size_t vlen);
+
+/**
+ * Retrieve the value of a header field by its key from the HTTP
+ * header fields structure.
+ *
+ * @param ff Pointer to the HTTP header fields structure.
+ * @param k  Null-terminated string containing the header key.
+ * @return   Pointer to the header value, or NULL if not found.
+ */
 const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
 				      const char *k);
+
+/**
+ * Retrieve the value of a header field by its key, using an explicit
+ * key length, from the HTTP header fields structure.
+ *
+ * @param ff   Pointer to the HTTP header fields structure.
+ * @param k    Pointer to the header key.
+ * @param klen Length of the header key.
+ * @return     Pointer to the header value, or NULL if not found.
+ */
 const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 				       const char *k, size_t klen);
+
+/**
+ * Parses an HTTP body encoded with chunked transfer encoding.
+ *
+ * @param ctx      Pointer to the HTTP body parsing context structure.
+ * @param dst      Buffer where the parsed body data will be written.
+ * @param dst_len  Length of the destination buffer in bytes.
+ *
+ * @return 0 on success,
+ *         -EAGAIN if more data is needed,
+ *         -EINVAL if the chunked body is malformed,
+ *         -ENOBUFS if the destination buffer is not large enough.
+ */
+int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
+				  char *dst, size_t dst_len);
 
 #endif /* #ifndef GWNET_HTTP1_H */

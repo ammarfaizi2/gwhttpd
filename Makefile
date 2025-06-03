@@ -1,13 +1,19 @@
 CFLAGS = -Wall -Wextra -Os -g -fno-strict-aliasing -ffunction-sections \
 	-fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector \
 	-Wno-unused-function -Wno-unused-variable -Wno-unused-parameter
-LDFLAGS = -static-libasan
+LDFLAGS =
 DEPFLAGS = -MMD -MP -MF $@.d
 LIBS = -lpthread
 
 ifeq ($(SANITIZE),1)
 	CFLAGS += -fsanitize=address -fsanitize=undefined
 	LDFLAGS += -fsanitize=address -fsanitize=undefined
+	LIBS += -static-libasan
+endif
+
+ifeq ($(LTO),1)
+	CFLAGS += -flto
+	LDFLAGS += -flto
 endif
 
 GWHTTPD_CC_OBJ = \
