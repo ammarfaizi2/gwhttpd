@@ -4,6 +4,7 @@
  *
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
+#define GWNET_HTTP1_TESTS
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -526,12 +527,11 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 }
 
 /**
- * Parses HTTP header fields from the provided parsing context.
+ * Parse HTTP header fields from the provided parsing context.
  *
  * According to RFC 7230, Section 3.2: "Each header field consists of a
  * case-insensitive field name followed by a colon (":"), optional
- * whitespace, and the field value." This function processes the header
- * fields as described in the RFC.
+ * whitespace, and the field value."
  *
  * Reference: RFC 7230, Section 3.2 - Header Fields
  * https://datatracker.ietf.org/doc/html/rfc7230#section-3.2
@@ -1033,6 +1033,9 @@ static int parse_chunked_data(struct gwnet_http_body_pctx *ctx, char **dst_p,
 {
 	size_t len = ctx->len - ctx->off, copy_len;
 	const char *buf = &ctx->buf[ctx->off];
+
+	if (!len)
+		return -EAGAIN;
 
 	copy_len = min_st(ctx->rem_len, len);
 
@@ -1827,9 +1830,150 @@ static void test_res_hdr_invalid_field_key_chars(void)
 	PRTEST_OK();
 }
 
+static void test_req_hdr_handle_short_recv(void)
+{
+	static const char buf[] =
+		"GET /aa?a=b&c=d HTTP/1.1\r\n"			// 26
+		"Host: example.com\r\n"				// 26 + 19 = 45
+		"User-Agent: gwhttp\r\n"			// 45 + 20 = 65
+		"Referer: http://example.com/test.html\r\n"	// 65 + 39 = 104
+		"\r\n";						// 104 + 2 = 106
+	const char *bp = buf;
+	size_t len = sizeof(buf) - 1, i;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+
+	i = 0;
+	while (bp < &buf[len]) {
+		i++;
+		ctx.buf = bp;
+		ctx.len = i;
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		if (!ctx.off) {
+			assert(r == -EAGAIN);
+			continue;
+		}
+
+		bp += ctx.off;
+		i -= ctx.off;
+		ctx.off = 0;
+
+		if (bp < &buf[len])
+			assert(r == -EAGAIN);
+
+		if (bp == &buf[len])
+			assert(!r);
+
+		if (bp >= &buf[26]) {
+			assert(hdr.method == GWNET_HTTP_METHOD_GET);
+			assert(!strcmp(hdr.uri, "/aa?a=b&c=d"));
+			assert(!strcmp(hdr.qs, "a=b&c=d"));
+			assert(hdr.version == GWNET_HTTP_VER_1_1);
+		}
+
+		if (bp >= &buf[45]) {
+			assert(hdr.fields.nr >= 1);
+			ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
+		}
+
+		if (bp >= &buf[65]) {
+			assert(hdr.fields.nr >= 2);
+			ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
+		}
+
+		if (bp >= &buf[104]) {
+			assert(hdr.fields.nr >= 3);
+			ASSERT_HDRF(&hdr.fields.ff[2], "Referer", "http://example.com/test.html");
+		}
+	}
+
+	gwnet_http_req_hdr_free(&hdr);
+	PRTEST_OK();
+}
+
+static void test_res_hdr_handle_short_recv(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 404 Not Found\r\n"			// 24
+		"Server: gwhttpd\r\n"				// 24 + 17 = 41
+		"Date: Mon, 01 Jan 1999 00:00:00 GMT\r\n"	// 41 + 37 = 78
+		"Content-Type: text/html; charset=UTF-8\r\n"	// 78 + 40 = 118
+		"Content-Length: 1234\r\n"			// 118 + 22 = 140
+		"Connection: close\r\n"				// 140 + 19 = 159
+		"\r\n";						// 159 + 2 = 161
+	const char *bp = buf;
+	size_t len = sizeof(buf) - 1, i;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+
+	i = 0;
+	while (bp < &buf[len]) {
+		i++;
+		ctx.buf = bp;
+		ctx.len = i;
+		r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+		if (!ctx.off) {
+			assert(r == -EAGAIN);
+			continue;
+		}
+
+		bp += ctx.off;
+		i -= ctx.off;
+		ctx.off = 0;
+
+		if (bp < &buf[len])
+			assert(r == -EAGAIN);
+
+		if (bp == &buf[len])
+			assert(!r);
+
+		if (bp >= &buf[24]) {
+			assert(hdr.code == 404);
+			assert(!strcmp(hdr.reason, "Not Found"));
+			assert(hdr.version == GWNET_HTTP_VER_1_1);
+		}
+
+		if (bp >= &buf[41]) {
+			assert(hdr.fields.nr >= 1);
+			ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd");
+		}
+
+		if (bp >= &buf[78]) {
+			assert(hdr.fields.nr >= 2);
+			ASSERT_HDRF(&hdr.fields.ff[1], "Date", "Mon, 01 Jan 1999 00:00:00 GMT");
+		}
+
+		if (bp >= &buf[118]) {
+			assert(hdr.fields.nr >= 3);
+			ASSERT_HDRF(&hdr.fields.ff[2], "Content-Type", "text/html; charset=UTF-8");
+		}
+
+		if (bp >= &buf[140]) {
+			assert(hdr.fields.nr >= 4);
+			ASSERT_HDRF(&hdr.fields.ff[3], "Content-Length", "1234");
+		}
+
+		if (bp >= &buf[159]) {
+			assert(hdr.fields.nr >= 5);
+			ASSERT_HDRF(&hdr.fields.ff[4], "Connection", "close");
+		}
+	}
+
+	gwnet_http_res_hdr_free(&hdr);
+	PRTEST_OK();
+}
+
 static void test_body_chunked_simple(void)
 {
-	const char buf[] =
+	static const char buf[] =
 		"5\r\n"
 		"Hello\r\n"
 		"0\r\n"
@@ -1853,7 +1997,7 @@ static void test_body_chunked_simple(void)
 
 static void test_body_chunked_multiple_chunks(void)
 {
-	const char buf[] =
+	static const char buf[] =
 		"5\r\n"
 		"Hello\r\n"
 		"6\r\n"
@@ -1882,7 +2026,7 @@ static void test_body_chunked_multiple_chunks(void)
 
 static void test_body_chunked_empty(void)
 {
-	const char buf[] =
+	static const char buf[] =
 		"0\r\n"
 		"\r\n";
 	const size_t len = sizeof(buf) - 1;
@@ -1904,7 +2048,7 @@ static void test_body_chunked_empty(void)
 
 static void test_body_chunked_multiple_various_lengths(void)
 {
-	const char buf[] =
+	static const char buf[] =
 		"a\r\n"
 		"1234567890\r\n"
 		"5\r\n"
@@ -1937,7 +2081,7 @@ static void test_body_chunked_multiple_various_lengths(void)
 
 static void test_body_chunked_dst_buffer_too_small(void)
 {
-	const char buf[] =
+	static const char buf[] =
 		"5\r\n"
 		"Hello\r\n"
 		"6\r\n"
@@ -1996,6 +2140,74 @@ static void test_body_chunked_dst_buffer_too_small(void)
 	PRTEST_OK();
 }
 
+static void test_body_chunked_short_recv(void)
+{
+	static const char src[] =
+		"5\r\n"		// 3
+		"Hello\r\n"	// 3 + 7 = 10
+		"6\r\n"		// 10 + 3 = 13
+		" World\r\n"	// 13 + 8 = 21
+		"0\r\n"		// 21 + 3 = 24
+		"\r\n";		// 24 + 2 = 26
+	static const size_t src_len = sizeof(src) - 1;
+	const char *src_p = src;
+	char dst[sizeof(src)] = { 0 };
+	char *dst_p = dst;
+	size_t dst_len = sizeof(dst);
+	size_t dst_rem_len = dst_len;
+	struct gwnet_http_body_pctx ctx;
+	size_t i;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	i = 0;
+	while (src_p < &src[src_len]) {
+		ctx.buf = src_p;
+		ctx.len = i++;
+		r = gwnet_http_body_parse_chunked(&ctx, dst_p, dst_rem_len);
+		if (!ctx.off) {
+			assert(r == -EAGAIN);
+			continue;
+		}
+
+		src_p += ctx.off;
+		i -= ctx.off;
+		ctx.off = 0;
+		dst_rem_len = dst_len - ctx.tot_len;
+		dst_p = &dst[ctx.tot_len];
+
+		if (src_p < &src[src_len])
+			assert(r == -EAGAIN);
+
+		if (src_p == &src[src_len])
+			assert(!r);
+
+		if (src_p >= &src[10]) {
+			assert(strlen(dst) >= 5);
+			assert(!strncmp(dst, "Hello", 5));
+			assert(ctx.tot_len >= 5);
+		}
+
+		if (src_p >= &src[21]) {
+			assert(strlen(dst) >= 11);
+			assert(!strncmp(dst, "Hello World", 11));
+			assert(ctx.tot_len >= 11);
+		}
+
+		if (src_p >= &src[24]) {
+			assert(strlen(dst) >= 11);
+			assert(!strncmp(dst, "Hello World", 11));
+			assert(ctx.tot_len == 11);
+		}
+	}
+
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	gwnet_http_body_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -2024,11 +2236,14 @@ int main(void)
 		test_res_hdr_invalid_field_val_chars();
 		test_req_hdr_invalid_field_key_chars();
 		test_res_hdr_invalid_field_key_chars();
+		test_req_hdr_handle_short_recv();
+		test_res_hdr_handle_short_recv();
 		test_body_chunked_simple();
 		test_body_chunked_multiple_chunks();
 		test_body_chunked_empty();
 		test_body_chunked_multiple_various_lengths();
 		test_body_chunked_dst_buffer_too_small();
+		test_body_chunked_short_recv();
 	}
 	printf("All tests passed!\n");
 	return 0;
