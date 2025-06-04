@@ -20,11 +20,18 @@ static inline size_t min_st(size_t a, size_t b)
 	return (a < b) ? a : b;
 }
 
-/*
- * tchar  = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-"
- *        / "." / "^" / "_" / "`" / "|" / "~"
- *        / DIGIT / ALPHA
- *        ; any VCHAR, except delimiters
+/**
+ * Checks if a character is a valid 'tchar' as defined in RFC 7230,
+ * Section 3.2.6.
+ * 
+ * Reference: https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6
+ *
+ * A 'tchar' is any visible (VCHAR) character except delimiters,
+ * specifically: "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-"
+ * / "." / "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA.
+ *
+ * @param  c The character to check, represented as an int.
+ * @return 1 if the character is a valid 'tchar', 0 otherwise.
  */
 static inline int is_tchar(int c)
 {
@@ -164,7 +171,8 @@ static bool is_field_allowed_to_be_duplicate(const char *key, size_t n)
  * @return     0 on success,
  *             -EAGAIN if more data is needed,
  *             -EINVAL if the request line is malformed,
- *             -ENOMEM if memory allocation fails.
+ *             -ENOMEM if memory allocation fails,
+ *             -E2BIG  if the request line exceeds the maximum length.
  */
 static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 				    struct gwnet_http_req_hdr *hdr)
@@ -226,6 +234,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	while (is_space(buf[off])) {
 		if (++off >= len)
 			return -EAGAIN;
+
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 	}
 
 	/*
@@ -261,6 +272,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		if (off >= len)
 			return -EAGAIN;
 
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
+
 		if (is_space(c))
 			break;
 
@@ -285,6 +299,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	while (is_space(buf[off])) {
 		if (++off >= len)
 			return -EAGAIN;
+
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 	}
 
 	/*
@@ -300,6 +317,14 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	off += 7;
 	if (off >= len)
 		return -EAGAIN;
+
+	/*
+	 * Check exceeding length upfront, we know that
+	 * the HTTP version is always 8 characters long
+	 * followed by a CRLF (or just LF).
+	 */
+	if (ctx->tot_len + off + 1 + 1 >= ctx->max_len)
+		return -E2BIG;
 
 	switch (buf[off]) {
 	case '0':
@@ -328,6 +353,8 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		return -EINVAL;
 
 	++off;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
 
 	hdr->uri = malloc(uri_len + 1);
 	if (!hdr->uri)
@@ -349,6 +376,7 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	hdr->method = method_code;
 	hdr->version = version_code;
 	ctx->off += off;
+	ctx->tot_len += off;
 	return 0;
 }
 
@@ -402,6 +430,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	off += 7;
 	if (off >= len)
 		return -EAGAIN;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
 
 	switch (buf[off]) {
 	case '0':
@@ -416,6 +446,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 	if (++off >= len)
 		return -EAGAIN;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
 
 	/*
 	 * After the HTTP version, there must be a space.
@@ -465,6 +497,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	while (is_space(buf[off])) {
 		if (++off >= len)
 			return -EAGAIN;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 	}
 
 	/*
@@ -485,6 +519,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 
 		if (++off >= len)
 			return -EAGAIN;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 
 		if (!is_vchar(c) && !is_space(c))
 			return -EINVAL;
@@ -495,11 +531,15 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (buf[off] == '\r') {
 		if (++off >= len)
 			return -EAGAIN;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 	}
 
 	if (buf[off] != '\n')
 		return -EINVAL;
 	++off;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
 
 	if (reason_len) {
 		/*
@@ -522,6 +562,7 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	hdr->version = version_code;
 	hdr->code = code;
 	ctx->off += off;
+	ctx->tot_len += off;
 	return 0;
 }
 
@@ -541,7 +582,8 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
  * @return    0 on success,
  *            -EAGAIN if more data is needed,
  *            -EINVAL if the header fields are malformed,
- *            -ENOMEM if memory allocation fails.
+ *            -ENOMEM if memory allocation fails,
+ *            -E2BIG  if the header fields exceed the maximum length.
  */
 static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			    struct gwnet_http_hdr_fields *ff)
@@ -557,10 +599,14 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		if (buf[off] == '\r') {
 			if (++off >= len)
 				return -EAGAIN;
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
 		}
 
 		if (buf[off] == '\n') {
 			++off;
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
 			ctx->off += off;
 			break;
 		}
@@ -584,6 +630,9 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			if (off >= len)
 				return -EAGAIN;
 
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
+
 			if (buf[off] == ':')
 				break;
 
@@ -606,6 +655,9 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		while (is_space(buf[off])) {
 			if (++off >= len)
 				return -EAGAIN;
+
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
 		}
 
 		v = &buf[off];
@@ -623,16 +675,23 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 			off++;
 			if (off >= len)
 				return -EAGAIN;
+
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
 		}
 
 		if (buf[off] == '\r') {
 			if (++off >= len)
 				return -EAGAIN;
+			if (ctx->tot_len + off >= ctx->max_len)
+				return -E2BIG;
 		}
 
 		if (buf[off] != '\n')
 			return -EINVAL;
 		++off;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 
 		if (vl) {
 			/*
@@ -649,9 +708,12 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		if (r)
 			return (r < 0) ? r : -EINVAL;
 
+		ctx->tot_len += off;
 		ctx->off += off;
 		if (off >= len)
 			return -EAGAIN;
+		if (ctx->tot_len + off >= ctx->max_len)
+			return -E2BIG;
 
 		buf = &ctx->buf[ctx->off];
 		len = ctx->len - ctx->off;
@@ -673,6 +735,13 @@ void gwnet_http_hdr_pctx_free(struct gwnet_http_hdr_pctx *ctx)
 	memset(ctx, 0, sizeof(*ctx));
 }
 
+static void prepare_parser(struct gwnet_http_hdr_pctx *ctx)
+{
+	ctx->tot_len = 0;
+	if (!ctx->max_len)
+		ctx->max_len = 1024*16;
+}
+
 static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 				      struct gwnet_http_req_hdr *hdr)
 {
@@ -681,6 +750,7 @@ static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE;
 		memset(hdr, 0, sizeof(*hdr));
+		prepare_parser(ctx);
 	}
 
 	if (!ctx->len)
@@ -711,6 +781,7 @@ static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE;
 		memset(hdr, 0, sizeof(*hdr));
+		prepare_parser(ctx);
 	}
 
 	if (!ctx->len)

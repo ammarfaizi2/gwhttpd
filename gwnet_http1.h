@@ -77,12 +77,68 @@ struct gwnet_http_res_hdr {
 };
 
 struct gwnet_http_hdr_pctx {
+
+	/*
+	 * Internally used to track the state of the parsing
+	 * operation.
+	 */
 	uint8_t		state;
+
+	/*
+	 * Filled by the parser to indicate the error reason
+	 * if the parsing operation fails. The caller may
+	 * check this field if the parser returns a negative
+	 * value.
+	 */
 	uint8_t		err;
+
+	/*
+	 * Filled by the caller to pass the buffer to be parsed.
+	 */
 	const char	*buf;
-	uint64_t	off;
+
+	/*
+	 * Filled by the caller to pass the length of the buffer
+	 * to be parsed. This is the total length of the buffer
+	 * passed in @buf.
+	 */
 	uint64_t	len;
+
+	/*
+	 * Initially set to zero, it will be filled with the length
+	 * of the number of bytes that have successfully been
+	 * parsed from the buffer. Partially parsed headers will
+	 * return -EAGAIN and advance this offset.
+	 *
+	 * The caller must reset this to zero before continuing the
+	 * parsing operation. In that case, the buffer must be
+	 * advanced to the next unparsed byte.
+	 */
+	uint64_t	off;
+
+
+	/*
+	 * Total length of the header section being parsed.
+	 * Accumulated from the first line and all header fields.
+	 * This is internally used by the parser to determine if the
+	 * total length of the header section exceeds the maximum
+	 * length.
+	 */
+	uint64_t	tot_len;
+
+	/*
+	 * Filled by the caller to limit the maximum length of the
+	 * request or response line. If set to 0, the maximum length
+	 * will be set to default by the parser (16384 bytes).
+	 */
 	uint64_t	max_len;
+};
+
+enum {
+	GWNET_HTTP_BODY_ERR_NONE		= 0,
+	GWNET_HTTP_BODY_ERR_MALFORMED		= 1,
+	GWNET_HTTP_BODY_ERR_TOO_LONG		= 2,
+	GWNET_HTTP_BODY_ERR_INTERNAL		= 100,
 };
 
 enum {
