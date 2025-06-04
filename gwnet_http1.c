@@ -807,11 +807,14 @@ static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 	return r;
 }
 
-static int translate_err(struct gwnet_http_hdr_pctx *ctx, int r)
+static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 {
 	switch (r) {
-	case -EAGAIN:
+	case 0:
 		ctx->err = GWNET_HTTP_HDR_ERR_NONE;
+		break;
+	case -EAGAIN:
+		ctx->err = GWNET_HTTP_HDR_ERR_INCOMPLETE;
 		break;
 	case -EINVAL:
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
@@ -830,21 +833,13 @@ static int translate_err(struct gwnet_http_hdr_pctx *ctx, int r)
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_req_hdr *hdr)
 {
-	int r = __gwnet_http_req_hdr_parse(ctx, hdr);
-	if (!r)
-		return r;
-
-	return translate_err(ctx, r);
+	return hdr_translate_ret_err(ctx, __gwnet_http_req_hdr_parse(ctx, hdr));
 }
 
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr)
 {
-	int r = __gwnet_http_res_hdr_parse(ctx, hdr);
-	if (!r)
-		return r;
-
-	return translate_err(ctx, r);
+	return hdr_translate_ret_err(ctx, __gwnet_http_res_hdr_parse(ctx, hdr));
 }
 
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
@@ -1240,11 +1235,29 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 	}
 
 	switch (r) {
+	case 0:
+		ctx->err = GWNET_HTTP_BODY_ERR_NONE;
+		break;
+	case -EAGAIN:
+		ctx->err = GWNET_HTTP_BODY_ERR_INCOMPLETE;
+		break;
 	case -EINVAL:
 		ctx->err = GWNET_HTTP_BODY_ERR_MALFORMED;
 		break;
 	case -E2BIG:
+		/*
+		 * The source is too long.
+		 */
 		ctx->err = GWNET_HTTP_BODY_ERR_TOO_LONG;
+		break;
+	case -ENOBUFS:
+		/*
+		 * The destination buffer is too small.
+		 */
+		ctx->err = GWNET_HTTP_BODY_ERR_DST_TOO_SMALL;
+		break;
+	default:
+		ctx->err = GWNET_HTTP_BODY_ERR_INTERNAL;
 		break;
 	}
 
@@ -2342,35 +2355,35 @@ static void test_body_chunked_dst_buffer_too_small(void)
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 2);
-	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_DST_TOO_SMALL);
 	assert(!strcmp(dst, "He"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 4);
-	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_DST_TOO_SMALL);
 	assert(!strcmp(dst, "ll"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 6);
-	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_DST_TOO_SMALL);
 	assert(!strcmp(dst, "o "));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 8);
-	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_DST_TOO_SMALL);
 	assert(!strcmp(dst, "Wo"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 10);
-	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_DST_TOO_SMALL);
 	assert(!strcmp(dst, "rl"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
@@ -2501,7 +2514,7 @@ int main(void)
 {
 	size_t i;
 
-	for (i = 0; i < 1000; i++) {
+	for (i = 0; i < 5000; i++) {
 		test_req_hdr_simple();
 		test_res_hdr_simple();
 		test_req_hdr_query_string();
