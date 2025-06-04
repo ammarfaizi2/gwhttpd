@@ -878,7 +878,6 @@ static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 	ssize_t ret;
 	size_t len;
 	void *buf;
-	int r;
 
 	ret = gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &len, true);
 	if (ret < 0)
@@ -897,8 +896,7 @@ static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 	return gwnet_tcp_buf_adv_tx(c, ret);
 }
 
-static int gwnet_tcp_srv_handle_client_in(struct gwnet_tcp_srv_wrk *w,
-					  struct epoll_event *ev,
+static int gwnet_tcp_srv_handle_client_in(struct epoll_event *ev,
 					  struct gwnet_tcp_cli *c)
 {
 	size_t tx_len;
@@ -969,7 +967,7 @@ static int gwnet_tcp_srv_handle_client(struct gwnet_tcp_srv_wrk *w,
 	int ret = 0;
 
 	if (ev->events & EPOLLIN) {
-		ret = gwnet_tcp_srv_handle_client_in(w, ev, c);
+		ret = gwnet_tcp_srv_handle_client_in(ev, c);
 		if (ret)
 			goto out_err;
 	}

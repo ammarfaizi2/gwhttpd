@@ -979,17 +979,16 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 	size_t len = ctx->len - ctx->off, off = 0, i = 0;
 	const char *buf = &ctx->buf[ctx->off];
 	uint64_t decoded_len = 0;
-	char tmp_buf[17], *e;
+	char tmp_buf[17], *e, c;
 
 	while (1) {
-		char c = buf[off];
+		if (off >= len)
+			return -EAGAIN;
 
 		if (i >= 16)
 			return -EINVAL;
 
-		if (off >= len)
-			return -EAGAIN;
-
+		c = buf[off];
 		if (!is_xdigit(c))
 			break;
 
@@ -997,15 +996,32 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 		off++;
 	}
 
-	if (buf[off] != '\r')
+	/*
+	 * Early exit if we haven't found any hex digits.
+	 */
+	if (!i)
 		return -EINVAL;
-	if (++off >= len)
-		return -EAGAIN;
 
-	if (buf[off] != '\n')
-		return -EINVAL;
-	if (++off >= len)
-		return -EAGAIN;
+	/*
+	 * We have read the hex digits. Now, we skip any chunk extension.
+	 * The extension is any character until we hit a CR or LF.
+	 * We are lenient: we accept LF without CR.
+	 */
+	while (1) {
+		if (off >= len)
+			return -EAGAIN;
+
+		c = buf[off++];
+		if (c == '\r') {
+			if (off >= len)
+				return -EAGAIN;
+			if (buf[off++] != '\n')
+				return -EINVAL;
+			break;
+		} else if (c == '\n') {
+			break;
+		}
+	}
 
 	tmp_buf[i] = '\0';
 	errno = 0;

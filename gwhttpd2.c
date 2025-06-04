@@ -227,28 +227,6 @@ static int parse_arg_and_init(int argc, char *argv[], gwnet_http_srv_t **srv_p)
 	return 0;
 }
 
-static char *trim_char(char *str, char c)
-{
-	char *end;
-
-	if (!str || !*str)
-		return str;
-
-	// Trim leading characters
-	while (*str == c)
-		str++;
-
-	// Trim trailing characters
-	end = str + strlen(str) - 1;
-	while (end > str && *end == c)
-		end--;
-
-	// Null-terminate the trimmed string
-	end[1] = '\0';
-
-	return str;
-}
-
 #if 0
 struct rt_ctx {
 	struct gwnet_http_srv *srv;
