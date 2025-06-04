@@ -157,6 +157,14 @@ struct gwnet_http_body_pctx {
 	uint8_t		state;
 
 	/*
+	 * Filled by the parser to indicate the error reason
+	 * if the parsing operation fails. The caller may
+	 * check this field if the parser returns a negative
+	 * value.
+	 */
+	uint8_t		err;
+
+	/*
 	 * Internally used to track the end of the chunked
 	 * transfer encoding parsing.
 	 */

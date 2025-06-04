@@ -712,8 +712,6 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 		ctx->off += off;
 		if (off >= len)
 			return -EAGAIN;
-		if (ctx->tot_len + off >= ctx->max_len)
-			return -E2BIG;
 
 		buf = &ctx->buf[ctx->off];
 		len = ctx->len - ctx->off;
@@ -1197,9 +1195,10 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
 		if (!ctx->max_len)
-			ctx->max_len = 1024*64;
+			ctx->max_len = 1024*128;
 		ctx->tot_len = 0;
 		ctx->tot_len_raw = 0;
+		ctx->err = GWNET_HTTP_BODY_ERR_NONE;
 	}
 
 	if (!ctx->len)
@@ -1228,6 +1227,15 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 			r = 0;
 			break;
 		}
+	}
+
+	switch (r) {
+	case -EINVAL:
+		ctx->err = GWNET_HTTP_BODY_ERR_MALFORMED;
+		break;
+	case -E2BIG:
+		ctx->err = GWNET_HTTP_BODY_ERR_TOO_LONG;
+		break;
 	}
 
 	return r;
@@ -2102,6 +2110,7 @@ static void test_body_chunked_simple(void)
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("Hello"));
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	gwnet_http_body_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2131,6 +2140,7 @@ static void test_body_chunked_multiple_chunks(void)
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("Hello World"));
 	assert(!strcmp(dst, "Hello World"));
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	gwnet_http_body_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2153,6 +2163,7 @@ static void test_body_chunked_empty(void)
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == 0);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	gwnet_http_body_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2186,6 +2197,7 @@ static void test_body_chunked_multiple_various_lengths(void)
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == strlen("1234567890HelloABCDEFGHIJWorld"));
 	assert(!strcmp(dst, "1234567890HelloABCDEFGHIJWorld"));
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	gwnet_http_body_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2215,36 +2227,42 @@ static void test_body_chunked_dst_buffer_too_small(void)
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 2);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(!strcmp(dst, "He"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 4);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(!strcmp(dst, "ll"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 6);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(!strcmp(dst, "o "));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 8);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(!strcmp(dst, "Wo"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(r == -ENOBUFS);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA);
 	assert(ctx.tot_len == 10);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(!strcmp(dst, "rl"));
 
 	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
 	assert(!r);
 	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
 	assert(ctx.tot_len == 11);
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
 	assert(dst[0] == 'd');
 
 	gwnet_http_body_pctx_free(&ctx);
