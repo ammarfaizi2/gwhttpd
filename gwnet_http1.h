@@ -231,6 +231,21 @@ const char *gwnet_http_hdr_fields_get(const struct gwnet_http_hdr_fields *ff,
 const char *gwnet_http_hdr_fields_getl(const struct gwnet_http_hdr_fields *ff,
 				       const char *k, size_t klen);
 
+
+/**
+ * Initialize the HTTP body processing context.
+ *
+ * Set up the provided gwnet_http_body_pctx structure for use in HTTP
+ * body processing. It should be called before any operations are
+ * performed on the context.
+ *
+ * @param ctx Pointer to a gwnet_http_body_pctx structure to be
+ *            initialized. Must not be NULL.
+ *
+ * @return 0 on success, or a negative error code on failure.
+ */
+int gwnet_http_body_pctx_init(struct gwnet_http_body_pctx *ctx);
+
 /**
  * Parses an HTTP body encoded with chunked transfer encoding.
  *

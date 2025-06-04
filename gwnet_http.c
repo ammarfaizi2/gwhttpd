@@ -84,10 +84,13 @@ struct gwnet_http_res {
 
 struct gwnet_http_req {
 	struct gwnet_http_req		*next;
-	uint8_t				chunk_state;
+	bool				is_chunked;
 	bool				is_body_oversized;
 	bool				keep_alive;
-	struct gwnet_http_hdr_pctx	hpctx;
+	union {
+		struct gwnet_http_hdr_pctx	hpctx;
+		struct gwnet_http_body_pctx	bpctx;
+	};
 	struct gwnet_http_req_hdr	hdr;
 	struct gwbuf			body_buf;
 	uint64_t			con_len;
@@ -551,10 +554,57 @@ static int handle_rx_st_init(gwnet_http_cli_t *hc, struct gwbuf *b)
 	return 1;
 }
 
+static int process_req_hdr(gwnet_http_cli_t *hc, struct gwnet_http_req *req)
+{
+	struct gwnet_http_hdr_fields *ff = &req->hdr.fields;
+	const char *v;
+	char *e;
+	
+	/*
+	 * TODO(ammarfaizi2): Handle keep-alive with timeout.
+	 */
+	v = gwnet_http_hdr_fields_get(ff, "connection");
+	if (v)
+		req->keep_alive = !strcasecmp(v, "keep-alive");
+	else
+		req->keep_alive = (req->hdr.version == GWNET_HTTP_VER_1_1);
+
+	v = gwnet_http_hdr_fields_get(ff, "content-length");
+	if (v) {
+		if (gwnet_http_hdr_fields_get(ff, "transfer-encoding"))
+			return -EINVAL;
+
+		errno = 0;
+		req->con_len = strtoull(v, &e, 10);
+		if (errno || *e)
+			return -EINVAL;
+
+		req->rcon_len = req->con_len;
+		req->is_chunked = false;
+		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
+		return 1;
+	}
+
+	/*
+	 * TODO(ammarfaizi2): Handle various transfer encodings
+	 * other than chunked.
+	 */
+	v = gwnet_http_hdr_fields_get(ff, "transfer-encoding");
+	if (v) {
+		req->is_chunked = !strcasecmp(v, "chunked");
+		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
+		return gwnet_http_body_pctx_init(&req->bpctx);
+	} else {
+		req->keep_alive = false;
+	}
+
+	hc->rx_state = GWNET_HTTP_RX_ST_DONE;
+	return 0;
+}
+
 static int handle_rx_st_hdr(gwnet_http_cli_t *hc, struct gwbuf *b)
 {
 	struct gwnet_http_req *req = gwnet_http_srv_cli_req_tail(hc);
-	struct gwnet_http_hdr_fields *ff = &req->hdr.fields;
 	const char *v;
 	int r;
 
@@ -573,44 +623,9 @@ static int handle_rx_st_hdr(gwnet_http_cli_t *hc, struct gwbuf *b)
 	if (r < 0)
 		return r;
 
-	v = gwnet_http_hdr_fields_get(ff, "connection");
-	if (v) {
-		if (!strcasecmp(v, "keep-alive"))
-			req->keep_alive = true;
-		else
-			req->keep_alive = false;
-	} else if (req->hdr.version == GWNET_HTTP_VER_1_1) {
-		req->keep_alive = true;
-	} else {
-		req->keep_alive = false;
-	}
-
-	v = gwnet_http_hdr_fields_get(ff, "content-length");
-	if (v) {
-		char *e;
-
-		if (gwnet_http_hdr_fields_get(ff, "transfer-encoding"))
-			return -EINVAL;
-
-		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
-
-		errno = 0;
-		req->con_len = strtoull(v, &e, 10);
-		if (errno || *e)
-			return -EINVAL;
-
-		req->rcon_len = req->con_len;
-		return 1;
-	}
-
-	v = gwnet_http_hdr_fields_get(ff, "transfer-encoding");
-	if (v) {
-		/*
-		 * TODO(ammarfaizi2): Add support for chunked
-		 * transfer encoding.
-		 */
-		return -EINVAL;
-	}
+	r = process_req_hdr(hc, req);
+	if (r < 0)
+		return r;
 
 	if (hc->rt_on_hdr_cb) {
 		r = hc->rt_on_hdr_cb(hc->data_cb, hc->srv, hc, req);
@@ -618,8 +633,68 @@ static int handle_rx_st_hdr(gwnet_http_cli_t *hc, struct gwbuf *b)
 			return r;
 	}
 
-	hc->rx_state = GWNET_HTTP_RX_ST_DONE;
 	return 1;
+}
+
+static int handle_rx_st_body_chunked(gwnet_http_cli_t *hc,
+				     struct gwnet_http_req *req,
+				     struct gwbuf *b)
+{
+	struct gwnet_http_body_pctx *bpctx = &req->bpctx;
+	size_t prev_tot_len, copied_len, to_copy_len;
+	struct gwbuf *bb = &req->body_buf;
+	char *dst_buf;
+	int r;
+
+	do {
+		to_copy_len = bb->cap - bb->len;
+		if (to_copy_len < 512) {
+			r = gwbuf_increase(bb, 512);
+			if (r < 0)
+				return r;
+			to_copy_len = bb->cap - bb->len;
+		}
+
+		dst_buf = bb->buf + bb->len;
+		bpctx->buf = b->buf;
+		bpctx->len = b->len;
+		bpctx->off = 0;
+		prev_tot_len = bpctx->tot_len;
+		r = gwnet_http_body_parse_chunked(bpctx, dst_buf, to_copy_len);
+		if (bpctx->off)
+			gwbuf_advance(b, bpctx->off);
+
+		copied_len = bpctx->tot_len - prev_tot_len;
+		bb->len += copied_len;
+	} while (r == -ENOBUFS);
+	return r;
+}
+
+static int handle_rx_st_body_non_chunked(gwnet_http_cli_t *hc,
+					 struct gwnet_http_req *req,
+					 struct gwbuf *b)
+{
+	size_t max_req_body_len = hc->srv->cfg.max_req_body_len;
+	size_t to_copy_len, orig_to_copy_len;
+	struct gwbuf *bb = &req->body_buf;
+	int r;
+
+	orig_to_copy_len = to_copy_len = min_st(req->rcon_len, b->len);
+
+	if (!req->is_body_oversized) {
+		if (to_copy_len + bb->len > max_req_body_len) {
+			req->is_body_oversized = true;
+			to_copy_len = max_req_body_len - bb->len;
+		}
+
+		r = gwbuf_append(bb, b->buf, to_copy_len);
+		if (r < 0)
+			return r;
+	}
+
+	gwbuf_advance(b, orig_to_copy_len);
+	req->rcon_len -= orig_to_copy_len;
+	return (req->rcon_len > 0) ? -EAGAIN : 0;
 }
 
 static int handle_rx_st_body(gwnet_http_cli_t *hc, struct gwbuf *b)
@@ -632,35 +707,17 @@ static int handle_rx_st_body(gwnet_http_cli_t *hc, struct gwbuf *b)
 
 	if (!req)
 		return -EINVAL;
-	if (!req->rcon_len)
-		goto out_done;
 	if (!b->len)
 		return -EAGAIN;
 
-	cp_len = min_st(req->rcon_len, b->len);
-	if (max_req_body_len) {
-		if (cp_len + bb->len > max_req_body_len) {
-			req->is_body_oversized = true;
-			cp_len = max_req_body_len - bb->len;
-		}
-	}
+	if (req->is_chunked)
+		r = handle_rx_st_body_chunked(hc, req, b);
+	else
+		r = handle_rx_st_body_non_chunked(hc, req, b);
 
-	if (!req->is_body_oversized) {
-		r = gwbuf_append(bb, b->buf, cp_len);
-		if (r < 0)
-			return r;
-	}
+	if (r < 0)
+		return r;
 
-	gwbuf_advance(b, cp_len);
-	assert(req->rcon_len >= cp_len);
-
-	req->rcon_len -= cp_len;
-	if (req->rcon_len) {
-		hc->rx_state = GWNET_HTTP_RX_ST_BODY;
-		return -EAGAIN;
-	}
-
-out_done:
 	if (hc->rt_on_body_cb) {
 		r = hc->rt_on_body_cb(hc->data_cb, hc->srv, hc, req);
 		if (r < 0)

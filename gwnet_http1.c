@@ -4,7 +4,6 @@
  *
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
-#define GWNET_HTTP1_TESTS
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
