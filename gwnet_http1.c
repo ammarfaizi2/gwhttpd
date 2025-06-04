@@ -1082,10 +1082,15 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 		if (off >= len)
 			return -EAGAIN;
 
+		if (ctx->tot_len_raw + off >= ctx->max_len)
+			return -E2BIG;
+
 		c = buf[off++];
 		if (c == '\r') {
 			if (off >= len)
 				return -EAGAIN;
+			if (ctx->tot_len_raw + off + 1 >= ctx->max_len)
+				return -E2BIG;
 			if (buf[off++] != '\n')
 				return -EINVAL;
 			break;
@@ -1101,7 +1106,14 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 		return -EINVAL;
 
 	ctx->off += off;
+	ctx->tot_len_raw += off;
 	ctx->rem_len = decoded_len;
+
+	/*
+	 * Predictive check for exceeding the maximum length.
+	 */
+	if (ctx->tot_len_raw + decoded_len >= ctx->max_len)
+		return -E2BIG;
 
 	if (decoded_len) {
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_DATA;
@@ -1131,6 +1143,9 @@ static int parse_chunked_data(struct gwnet_http_body_pctx *ctx, char **dst_p,
 	if (!copy_len)
 		return -ENOBUFS;
 
+	if (ctx->tot_len_raw + copy_len >= ctx->max_len)
+		return -E2BIG;
+
 	if (*dst_p) {
 		memcpy(*dst_p, buf, copy_len);
 		*dst_len_p -= copy_len;
@@ -1139,6 +1154,7 @@ static int parse_chunked_data(struct gwnet_http_body_pctx *ctx, char **dst_p,
 
 	ctx->off += copy_len;
 	ctx->tot_len += copy_len;
+	ctx->tot_len_raw += copy_len;
 	ctx->rem_len -= copy_len;
 
 	if (!ctx->rem_len)
@@ -1152,6 +1168,9 @@ static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
 	size_t len = ctx->len - ctx->off, cmpl;
 	const char *buf = &ctx->buf[ctx->off];
 
+	if (ctx->tot_len_raw + 2 >= ctx->max_len)
+		return -E2BIG;
+
 	cmpl = min_st(len, 2);
 	if (memcmp(buf, "\r\n", cmpl))
 		return -EINVAL;
@@ -1159,6 +1178,7 @@ static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
 		return -EAGAIN;
 
 	ctx->off += 2;
+	ctx->tot_len_raw += 2;
 	if (ctx->found_zero_len)
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_DONE;
 	else 
@@ -1174,8 +1194,13 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 	size_t *dst_len_p = dst_len_loc ? &dst_len_loc : NULL;
 	int r = 0;
 
-	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT)
+	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
+		if (!ctx->max_len)
+			ctx->max_len = 1024*64;
+		ctx->tot_len = 0;
+		ctx->tot_len_raw = 0;
+	}
 
 	if (!ctx->len)
 		return -EAGAIN;

@@ -150,13 +150,72 @@ enum {
 };
 
 struct gwnet_http_body_pctx {
+	/*
+	 * Internally used to track the state of the parsing
+	 * operation.
+	 */
 	uint8_t		state;
+
+	/*
+	 * Internally used to track the end of the chunked
+	 * transfer encoding parsing.
+	 */
 	bool		found_zero_len;
+
+	/*
+	 * Filled by the caller to pass the buffer to be parsed.
+	 * This is the raw HTTP body data.
+	 */
 	const char	*buf;
-	uint64_t	off;
+
+	/*
+	 * Filled by the caller to pass the length of the buffer
+	 * to be parsed. This is the total length of the buffer
+	 * passed in @buf.
+	 */
 	uint64_t	len;
+
+	/*
+	 * Initially set to zero, it will be filled with the length
+	 * of the number of bytes that have successfully been
+	 * parsed from the buffer. Partially parsed body will
+	 * return -EAGAIN and advance this offset.
+	 *
+	 * The caller must reset this to zero before continuing the
+	 * parsing operation. In that case, the buffer must be
+	 * advanced to the next unparsed byte.
+	 */
+	uint64_t	off;
+
+	/*
+	 * Length of the remaining data to be parsed in the current
+	 * chunk. This is used to track how many bytes are left to
+	 * read in the current chunked transfer encoding.
+	 */
 	uint64_t	rem_len;
+
+	/*
+	 * Total accumulated length of the all chunks parsed so far.
+	 */
 	uint64_t	tot_len;
+
+	/*
+	 * Total accumulated length of the parsed bytes. This includes
+	 * the chunked hex length, chunk extension, and the chunk data,
+	 * trailing CRLF, and the final zero-length chunk.
+	 *
+	 * The @max_len field will be checked against this value to
+	 * determine if the total length of the body exceeds the
+	 * maximum length allowed by the parser. If it does, the
+	 * parser will return -E2BIG.
+	 */
+	uint64_t	tot_len_raw;
+
+	/*
+	 * Filled by the caller to limit the maximum length of the
+	 * body being parsed. If set to 0, the maximum length
+	 * will be set to default by the parser (128 KiB).
+	 */
 	uint64_t	max_len;
 };
 
