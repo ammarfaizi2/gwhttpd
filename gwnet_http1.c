@@ -4,6 +4,9 @@
  *
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
+#ifndef GWNET_HTTP1_TESTS
+#define GWNET_HTTP1_TESTS
+#endif
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -737,7 +740,9 @@ static void prepare_parser(struct gwnet_http_hdr_pctx *ctx)
 {
 	ctx->tot_len = 0;
 	if (!ctx->max_len)
-		ctx->max_len = 1024*16;
+		ctx->max_len = (1024ull*16ull) + 1ull;
+	else
+		ctx->max_len += 1ull;
 }
 
 static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
@@ -810,6 +815,9 @@ static int translate_err(struct gwnet_http_hdr_pctx *ctx, int r)
 		break;
 	case -EINVAL:
 		ctx->err = GWNET_HTTP_HDR_ERR_MALFORMED;
+		break;
+	case -E2BIG:
+		ctx->err = GWNET_HTTP_HDR_ERR_TOO_LONG;
 		break;
 	default:
 		ctx->err = GWNET_HTTP_HDR_ERR_INTERNAL;
@@ -1195,7 +1203,9 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
 		if (!ctx->max_len)
-			ctx->max_len = 1024*128;
+			ctx->max_len = 1024ull*128ull;
+		else
+			ctx->max_len += 1ull;
 		ctx->tot_len = 0;
 		ctx->tot_len_raw = 0;
 		ctx->err = GWNET_HTTP_BODY_ERR_NONE;
@@ -2090,6 +2100,111 @@ static void test_res_hdr_handle_short_recv(void)
 	PRTEST_OK();
 }
 
+static void test_req_hdr_oversized(void)
+{
+	static const char buf[] =
+		"GET /index.html HTTP/1.1\r\n"
+		"Host: example.com\r\n"
+		"User-Agent: gwhttp\r\n"
+		"Referer: http://example.com/test.html\r\n"
+		"X-Test-Header: AAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_req_hdr hdr;
+	size_t i;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	ctx.max_len = sizeof(buf) - 1;
+	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(ctx.off == len);
+	assert(!strcmp(hdr.uri, "/index.html"));
+	assert(hdr.method == GWNET_HTTP_METHOD_GET);
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(!hdr.qs);
+	assert(hdr.fields.nr == 4);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Host", "example.com");
+	ASSERT_HDRF(&hdr.fields.ff[1], "User-Agent", "gwhttp");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Referer", "http://example.com/test.html");
+	ASSERT_HDRF(&hdr.fields.ff[3], "X-Test-Header", "AAAAAAAAAAAAAAAAAAAAAAAA");	
+	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+
+	for (i = 1; i <= (sizeof(buf) - 2); i++) {
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = buf;
+		ctx.len = len;
+		ctx.max_len = i;
+		r = gwnet_http_req_hdr_parse(&ctx, &hdr);
+		assert(r == -E2BIG);
+		assert(ctx.err == GWNET_HTTP_HDR_ERR_TOO_LONG);
+		gwnet_http_req_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
+
+	PRTEST_OK();
+}
+
+static void test_res_hdr_oversized(void)
+{
+	static const char buf[] =
+		"HTTP/1.1 200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"Date: Mon, 01 Jan 1999 00:00:00 GMT\r\n"
+		"Content-Type: text/html; charset=UTF-8\r\n"
+		"Content-Length: 1234\r\n"
+		"X-Test-Header: AAAAAAAAAAAAAAAAAAAAAAAA\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	size_t i;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	ctx.max_len = sizeof(buf) - 1;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(!r);
+	assert(ctx.err == GWNET_HTTP_HDR_ERR_NONE);
+	assert(ctx.off == len);
+	assert(hdr.code == 200);
+	assert(!strcmp(hdr.reason, "OK"));
+	assert(hdr.version == GWNET_HTTP_VER_1_1);
+	assert(hdr.fields.nr == 5);
+	ASSERT_HDRF(&hdr.fields.ff[0], "Server", "gwhttpd");
+	ASSERT_HDRF(&hdr.fields.ff[1], "Date", "Mon, 01 Jan 1999 00:00:00 GMT");
+	ASSERT_HDRF(&hdr.fields.ff[2], "Content-Type", "text/html; charset=UTF-8");
+	ASSERT_HDRF(&hdr.fields.ff[3], "Content-Length", "1234");
+	ASSERT_HDRF(&hdr.fields.ff[4], "X-Test-Header", "AAAAAAAAAAAAAAAAAAAAAAAA");	
+	gwnet_http_res_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+
+	for (i = 1; i <= (sizeof(buf) - 2); i++) {
+		r = gwnet_http_hdr_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = buf;
+		ctx.len = len;
+		ctx.max_len = i;
+		r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+		assert(r == -E2BIG);
+		assert(ctx.err == GWNET_HTTP_HDR_ERR_TOO_LONG);
+		gwnet_http_res_hdr_free(&hdr);
+		gwnet_http_hdr_pctx_free(&ctx);
+	}
+
+	PRTEST_OK();
+}
+
 static void test_body_chunked_simple(void)
 {
 	static const char buf[] =
@@ -2337,6 +2452,51 @@ static void test_body_chunked_short_recv(void)
 	PRTEST_OK();
 }
 
+static void test_body_chunked_oversized(void)
+{
+	static const char buf[] =
+		"5\r\n"
+		"Hello\r\n"
+		"6\r\n"
+		" World\r\n"
+		"0\r\n"
+		"\r\n";
+	const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_body_pctx ctx;
+	char dst[sizeof(buf)] = { 0 };
+	size_t dst_len = sizeof(dst) - 1;
+	size_t i;
+	int r;
+
+	r = gwnet_http_body_pctx_init(&ctx);
+	assert(!r);
+
+	ctx.buf = buf;
+	ctx.len = len;
+	ctx.max_len = sizeof(buf) - 1;
+	r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+	assert(!r);
+	assert(ctx.state == GWNET_HTTP_BODY_PARSE_ST_CHK_DONE);
+	assert(ctx.tot_len == strlen("Hello World"));
+	assert(!strcmp(dst, "Hello World"));
+	assert(ctx.err == GWNET_HTTP_BODY_ERR_NONE);
+	gwnet_http_body_pctx_free(&ctx);
+
+	for (i = 1; i <= (sizeof(buf) - 2); i++) {
+		r = gwnet_http_body_pctx_init(&ctx);
+		assert(!r);
+		ctx.buf = buf;
+		ctx.len = len;
+		ctx.max_len = i;
+		r = gwnet_http_body_parse_chunked(&ctx, dst, dst_len);
+		assert(r == -E2BIG);
+		assert(ctx.err == GWNET_HTTP_BODY_ERR_TOO_LONG);
+		gwnet_http_body_pctx_free(&ctx);
+	}
+
+	PRTEST_OK();
+}
+
 int main(void)
 {
 	size_t i;
@@ -2367,12 +2527,15 @@ int main(void)
 		test_res_hdr_invalid_field_key_chars();
 		test_req_hdr_handle_short_recv();
 		test_res_hdr_handle_short_recv();
+		test_req_hdr_oversized();
+		test_res_hdr_oversized();
 		test_body_chunked_simple();
 		test_body_chunked_multiple_chunks();
 		test_body_chunked_empty();
 		test_body_chunked_multiple_various_lengths();
 		test_body_chunked_dst_buffer_too_small();
 		test_body_chunked_short_recv();
+		test_body_chunked_oversized();
 	}
 	printf("All tests passed!\n");
 	return 0;
