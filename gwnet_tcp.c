@@ -1045,6 +1045,9 @@ static int gwnet_tcp_srv_handle_events(int nr_events,
 
 		if (w->epl_need_rearm)
 			break;
+
+		if (w->ctx->should_stop)
+			break;
 	}
 
 	return ret;

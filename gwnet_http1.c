@@ -1,22 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * gwnet_http1.c - HTTP/1.0 and HTTP/1.1 parser.
+ * http_logger.c - HTTP logger via LD_PRELOAD.
  *
+ * gcc -Wall -Wextra -fpic -fPIC -Os http_logger.c -o http_logger.so
+ * 
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
-#ifndef GWNET_HTTP1_TESTS
-#define GWNET_HTTP1_TESTS
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
 #endif
+
+#include "gwnet_http1.h"
+
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
 #include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
 
-#include "gwnet_http1.h"
 
 static inline size_t min_st(size_t a, size_t b)
 {
@@ -201,6 +206,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	const char *uri, *qs, *buf = &ctx->buf[ctx->off];
 	uint8_t method_code, version_code;
 	uint32_t uri_len, qs_len;
+
+	if (!len)
+		return -EAGAIN;
 
 	method_code = GWNET_HTTP_METHOD_UNKNOWN;
 	for (i = 0; i < nr_methods; i++) {
@@ -595,6 +603,9 @@ static int parse_hdr_fields(struct gwnet_http_hdr_pctx *ctx,
 	const char *buf = &ctx->buf[ctx->off];
 	int r;
 
+	if (!len)
+		return -EAGAIN;
+
 	while (1) {
 		const char *k, *v, *p;
 		uint32_t kl, vl;
@@ -756,9 +767,6 @@ static int __gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 		prepare_parser(ctx);
 	}
 
-	if (!ctx->len)
-		return -EAGAIN;
-
 	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE) {
 		r = parse_hdr_req_first_line(ctx, hdr);
 		if (r)
@@ -786,9 +794,6 @@ static int __gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 		memset(hdr, 0, sizeof(*hdr));
 		prepare_parser(ctx);
 	}
-
-	if (!ctx->len)
-		return -EAGAIN;
 
 	if (ctx->state == GWNET_HTTP_HDR_PARSE_ST_FIRST_LINE) {
 		r = parse_hdr_res_first_line(ctx, hdr);
@@ -1053,6 +1058,9 @@ static int parse_chunked_len(struct gwnet_http_body_pctx *ctx)
 	uint64_t decoded_len = 0;
 	char tmp_buf[17], *e, c;
 
+	if (!len)
+		return -EAGAIN;
+
 	while (1) {
 		if (off >= len)
 			return -EAGAIN;
@@ -1138,7 +1146,7 @@ static int parse_chunked_data(struct gwnet_http_body_pctx *ctx, char **dst_p,
 
 	copy_len = min_st(ctx->rem_len, len);
 
-	if (dst_len_p)
+	if (*dst_p)
 		copy_len = min_st(copy_len, *dst_len_p);
 
 	if (!copy_len)
@@ -1169,6 +1177,9 @@ static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
 	size_t len = ctx->len - ctx->off, cmpl;
 	const char *buf = &ctx->buf[ctx->off];
 
+	if (!len)
+		return -EAGAIN;
+
 	if (ctx->tot_len_raw + 2 >= ctx->max_len)
 		return -E2BIG;
 
@@ -1191,23 +1202,24 @@ static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
 int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 				  char *dst, size_t dst_len)
 {
-	size_t dst_len_loc = dst_len;
-	size_t *dst_len_p = dst_len_loc ? &dst_len_loc : NULL;
 	int r = 0;
+
+	/*
+	 * If @dst is NULL, the @dst_len must be zero.
+	 */
+	if (!dst && dst_len)
+		return -EINVAL;
 
 	if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_INIT) {
 		ctx->state = GWNET_HTTP_BODY_PARSE_ST_CHK_LEN;
 		if (!ctx->max_len)
-			ctx->max_len = 1024ull*128ull;
+			ctx->max_len = (1024ull*128ull) + 1ull;
 		else
 			ctx->max_len += 1ull;
 		ctx->tot_len = 0;
 		ctx->tot_len_raw = 0;
 		ctx->err = GWNET_HTTP_BODY_ERR_NONE;
 	}
-
-	if (!ctx->len)
-		return -EAGAIN;
 
 	while (1) {
 		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_LEN) {
@@ -1217,7 +1229,7 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 		}
 
 		if (ctx->state == GWNET_HTTP_BODY_PARSE_ST_CHK_DATA) {
-			r = parse_chunked_data(ctx, &dst, dst_len_p);
+			r = parse_chunked_data(ctx, &dst, &dst_len);
 			if (r)
 				break;
 		}
