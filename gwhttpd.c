@@ -26,7 +26,9 @@ static const struct option long_opts[] = {
 	{ "max-req-hdr-len",	required_argument,	NULL,	'H' },
 	{ "max-req-body-len",	required_argument,	NULL,	'B' },
 	{ "help",		no_argument,		NULL,	'h' },
+#ifdef GWNET_HTTP1_TESTS
 	{ "run-tests",		no_argument,		NULL,	1 },
+#endif
 	{ NULL, 0, NULL, 0 }
 };
 static const char short_opts[] = "b:p:n:r:R:t:H:B:h";
@@ -178,10 +180,12 @@ static int __parse_arg(const char *app, int c, struct gwnet_tcp_srv_cfg *tc,
 	case 'h':
 		show_help(app);
 		exit(0);
+#ifdef GWNET_HTTP1_TESTS
 	case 1:
 		gwnet_http_run_tests();
 		exit(0);
 		break;
+#endif
 	default:
 		fprintf(stderr, "Error: Unknown option: %c\n", c);
 		show_help(app);

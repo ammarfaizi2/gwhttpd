@@ -1,4 +1,4 @@
-CFLAGS = -Wall -Wextra -O2 -g -fno-strict-aliasing -ffunction-sections \
+CFLAGS = -Wall -Wextra -Os -g -fno-strict-aliasing -ffunction-sections \
 	-fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector
 LDFLAGS =
 DEPFLAGS = -MMD -MP -MF $@.d

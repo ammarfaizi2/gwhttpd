@@ -8,8 +8,6 @@
 #define _GNU_SOURCE
 #endif
 
-#define GWNET_HTTP1_TESTS
-
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
