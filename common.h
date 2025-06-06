@@ -17,4 +17,14 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
+#ifndef __cold
+#define __cold __attribute__((__cold__))
+#endif
+
+#ifndef __hot
+#define __hot __attribute__((__hot__))
+#endif
+
+#include "syscall.h"
+
 #endif /* #ifndef COMMON_H */

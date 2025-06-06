@@ -11,18 +11,18 @@ ifeq ($(SANITIZE),1)
 endif
 
 ifeq ($(LTO),1)
-	CFLAGS += -flto=full
-	LDFLAGS += -flto=full
+	CFLAGS += -flto
+	LDFLAGS += -flto
 endif
 
 ifeq ($(STATIC),1)
 	LDFLAGS += -static
 endif
 
-ifeq ($(RELEASE_MODE),1)
-	CFLAGS += -DNDEBUG
-else
+ifeq ($(DEBUG),1)
 	CFLAGS += -DDEBUG
+else
+	CFLAGS += -DNDEBUG
 endif
 
 GWHTTPD_CC_OBJ = \
@@ -30,12 +30,12 @@ GWHTTPD_CC_OBJ = \
 	gwnet_http.o \
 	gwnet_http1.o \
 	gwnet_tcp.o \
-	gwhttpd2.o
+	gwhttpd.o
 
-all: gwhttpd2
+all: gwhttpd
 
-gwhttpd2: $(GWHTTPD_CC_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LIBS)
+gwhttpd: $(GWHTTPD_CC_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIBS) $(LDFLAGS)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
@@ -43,6 +43,6 @@ gwhttpd2: $(GWHTTPD_CC_OBJ)
 -include $(GWHTTPD_CC_OBJ:.o=.o.d)
 
 clean:
-	rm -f *.o *.o.d gwhttpd2
+	rm -f *.o *.o.d gwhttpd
 
 .PHONY: all clean

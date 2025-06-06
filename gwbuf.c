@@ -1,5 +1,6 @@
 
 #include "gwbuf.h"
+#include "common.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,7 @@ static int gwbuf_set_cap(struct gwbuf *b, uint64_t new_cap)
 	return 0;
 }
 
+__hot
 int gwbuf_increase(struct gwbuf *b, uint64_t inc)
 {
 	if (!inc)
@@ -46,6 +48,7 @@ int gwbuf_increase(struct gwbuf *b, uint64_t inc)
 	return gwbuf_set_cap(b, b->cap + inc);
 }
 
+__hot
 void gwbuf_free(struct gwbuf *b)
 {
 	if (!b || !b->buf || !b->orig_buf)
@@ -55,6 +58,7 @@ void gwbuf_free(struct gwbuf *b)
 	memset(b, 0, sizeof(*b));
 }
 
+__hot
 void gwbuf_advance(struct gwbuf *b, uint64_t len)
 {
 	if (len >= b->len) {
@@ -67,6 +71,7 @@ void gwbuf_advance(struct gwbuf *b, uint64_t len)
 	b->buf[b->len] = '\0';
 }
 
+__hot
 void gwbuf_soft_advance(struct gwbuf *b, uint64_t len)
 {
 	assert(len <= b->len);
@@ -74,6 +79,7 @@ void gwbuf_soft_advance(struct gwbuf *b, uint64_t len)
 	b->len -= len;
 }
 
+__hot
 void gwbuf_soft_advance_sync(struct gwbuf *b)
 {
 	assert(b->buf >= b->orig_buf);
@@ -89,6 +95,7 @@ void gwbuf_soft_advance_sync(struct gwbuf *b)
 	b->buf = b->orig_buf;
 }
 
+__hot
 int gwbuf_prepare_need(struct gwbuf *b, uint64_t need)
 {
 	uint64_t needed_len = b->len + need;
@@ -104,6 +111,7 @@ int gwbuf_prepare_need(struct gwbuf *b, uint64_t need)
 	return gwbuf_set_cap(b, new_cap);
 }
 
+__hot
 int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 {
 	va_list args, args2;
@@ -128,6 +136,7 @@ out:
 	return ret;
 }
 
+__hot
 int gwbuf_append(struct gwbuf *b, const void *data, uint64_t len)
 {
 	int ret;
@@ -142,6 +151,7 @@ int gwbuf_append(struct gwbuf *b, const void *data, uint64_t len)
 	return 0;
 }
 
+__hot
 void gwbuf_move(struct gwbuf *dst, struct gwbuf *src)
 {
 	gwbuf_free(dst);
