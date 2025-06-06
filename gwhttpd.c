@@ -26,6 +26,7 @@ static const struct option long_opts[] = {
 	{ "max-req-hdr-len",	required_argument,	NULL,	'H' },
 	{ "max-req-body-len",	required_argument,	NULL,	'B' },
 	{ "help",		no_argument,		NULL,	'h' },
+	{ "run-tests",		no_argument,		NULL,	1 },
 	{ NULL, 0, NULL, 0 }
 };
 static const char short_opts[] = "b:p:n:r:R:t:H:B:h";
@@ -71,6 +72,7 @@ static void show_help(const char *app)
 	printf("  -H, --max-req-hdr-len <len>   Maximum request header length (default: %u)\n", hc->max_req_hdr_len);
 	printf("  -B, --max-req-body-len <len>  Maximum request body length (default: %llu)\n", (unsigned long long)hc->max_req_body_len);
 	printf("  -h, --help                    Show this help message and exit\n");
+	printf("  --run-tests                   Run tests and exit\n");
 	printf("\n");
 }
 
@@ -175,7 +177,11 @@ static int __parse_arg(const char *app, int c, struct gwnet_tcp_srv_cfg *tc,
 		break;
 	case 'h':
 		show_help(app);
-		return 0;
+		exit(0);
+	case 1:
+		gwnet_http_run_tests();
+		exit(0);
+		break;
 	default:
 		fprintf(stderr, "Error: Unknown option: %c\n", c);
 		show_help(app);

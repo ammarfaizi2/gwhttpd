@@ -387,4 +387,10 @@ int gwnet_http_body_pctx_init(struct gwnet_http_body_pctx *ctx);
 int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 				  char *dst, size_t dst_len);
 
+
+/**
+ * Run all tests related to the HTTP/1.x parser.
+ */
+void gwnet_http_run_tests(void);
+
 #endif /* #ifndef GWNET_HTTP1_H */

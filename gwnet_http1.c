@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * http_logger.c - HTTP logger via LD_PRELOAD.
- *
- * gcc -Wall -Wextra -fpic -fPIC -Os http_logger.c -o http_logger.so
+ * gwnet_http1.c - HTTP/1.x parser implementation.
  * 
  * Copyright (C) 2025  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  */
@@ -10,18 +8,19 @@
 #define _GNU_SOURCE
 #endif
 
-#include "gwnet_http1.h"
+#define GWNET_HTTP1_TESTS
 
 #include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "gwnet_http1.h"
+#include "common.h"
 
 static inline size_t min_st(size_t a, size_t b)
 {
@@ -835,18 +834,21 @@ static int hdr_translate_ret_err(struct gwnet_http_hdr_pctx *ctx, int r)
 	return r;
 }
 
+__hot
 int gwnet_http_req_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_req_hdr *hdr)
 {
 	return hdr_translate_ret_err(ctx, __gwnet_http_req_hdr_parse(ctx, hdr));
 }
 
+__hot
 int gwnet_http_res_hdr_parse(struct gwnet_http_hdr_pctx *ctx,
 			     struct gwnet_http_res_hdr *hdr)
 {
 	return hdr_translate_ret_err(ctx, __gwnet_http_res_hdr_parse(ctx, hdr));
 }
 
+__hot
 void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
 {
 	if (!hdr)
@@ -858,6 +860,7 @@ void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
 	memset(hdr, 0, sizeof(*hdr));
 }
 
+__hot
 void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr)
 {
 	if (!hdr)
@@ -868,6 +871,7 @@ void gwnet_http_res_hdr_free(struct gwnet_http_res_hdr *hdr)
 	memset(hdr, 0, sizeof(*hdr));
 }
 
+__hot
 void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff)
 {
 	size_t i;
@@ -884,12 +888,14 @@ void gwnet_http_hdr_fields_free(struct gwnet_http_hdr_fields *ff)
 	memset(ff, 0, sizeof(*ff));
 }
 
+__hot
 int gwnet_http_hdr_fields_add(struct gwnet_http_hdr_fields *ff, const char *k,
 			      const char *v)
 {
 	return gwnet_http_hdr_fields_addl(ff, k, strlen(k), v, strlen(v));
 }
 
+__hot
 int gwnet_http_hdr_fields_addf(struct gwnet_http_hdr_fields *ff,
 			       const char *k, const char *fmt, ...)
 {
@@ -934,6 +940,7 @@ static ssize_t find_hdr_field_idx(const struct gwnet_http_hdr_fields *ff,
 	return -ENOENT;
 }
 
+__hot
 int gwnet_http_hdr_fields_addl(struct gwnet_http_hdr_fields *ff,
 			       const char *k, size_t klen,
 			       const char *v, size_t vlen)
@@ -1199,6 +1206,7 @@ static int parse_chunked_tr(struct gwnet_http_body_pctx *ctx)
 	return 0;
 }
 
+__hot
 int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 				  char *dst, size_t dst_len)
 {
@@ -1277,7 +1285,11 @@ int gwnet_http_body_parse_chunked(struct gwnet_http_body_pctx *ctx,
 }
 
 #ifdef GWNET_HTTP1_TESTS
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 
+#include <assert.h>
 #define PRTEST_OK()					\
 do {							\
 	static bool __printed;				\
@@ -2522,10 +2534,9 @@ static void test_body_chunked_oversized(void)
 	PRTEST_OK();
 }
 
-int main(void)
+void gwnet_http_run_tests(void)
 {
 	size_t i;
-
 	for (i = 0; i < 5000; i++) {
 		test_req_hdr_simple();
 		test_res_hdr_simple();
@@ -2563,6 +2574,13 @@ int main(void)
 		test_body_chunked_oversized();
 	}
 	printf("All tests passed!\n");
+}
+
+#ifdef GWNET_HTTP1_RUN_TESTS
+int main(void)
+{
+	gwnet_http_run_tests();
 	return 0;
 }
+#endif /* #ifdef GWNET_HTTP1_RUN_TESTS */
 #endif /* #ifdef GWNET_HTTP1_TESTS */
