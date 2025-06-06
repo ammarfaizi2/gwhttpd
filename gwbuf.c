@@ -6,88 +6,108 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
+#include <assert.h>
 
-int gwbuf_init(struct gwbuf *b, size_t cap)
+int gwbuf_init(struct gwbuf *b, uint64_t cap)
 {
-	if (cap == 0)
-		cap = 1023;
+	if (!cap)
+		cap = 1023ull;
 
-	b->buf = malloc(cap + 1);
+	b->orig_buf = b->buf = malloc(cap + 1ull);
 	if (!b->buf)
 		return -ENOMEM;
 
+	b->buf[cap] = '\0';
 	b->len = 0;
 	b->cap = cap;
-	b->buf[0] = b->buf[cap] = '\0';
 	return 0;
 }
 
-int gwbuf_increase(struct gwbuf *b, size_t inc)
+static int gwbuf_set_cap(struct gwbuf *b, uint64_t new_cap)
 {
-	size_t new_cap = b->cap + inc;
 	char *new_buf;
 
-	if (new_cap < b->cap)
-		return -ENOMEM; // Overflow
-
-	new_buf = realloc(b->buf, new_cap + 1);
+	new_buf = realloc(b->buf, new_cap + 1ull);
 	if (!new_buf)
 		return -ENOMEM;
 
-	b->buf = new_buf;
+	b->orig_buf = b->buf = new_buf;
 	b->cap = new_cap;
-	b->buf[b->len] = b->buf[b->cap] = '\0';
+	b->len = (b->len > new_cap) ? new_cap : b->len;
+	b->buf[b->cap] = b->buf[b->len] = '\0';
 	return 0;
+}
+
+int gwbuf_increase(struct gwbuf *b, uint64_t inc)
+{
+	if (!inc)
+		return 0;
+
+	return gwbuf_set_cap(b, b->cap + inc);
 }
 
 void gwbuf_free(struct gwbuf *b)
 {
-	if (b->buf) {
-		free(b->buf);
-		b->buf = NULL;
-		b->len = 0;
-		b->cap = 0;
-	}
-}
-
-void gwbuf_advance(struct gwbuf *b, size_t len)
-{
-	if (len > b->len)
+	if (!b || !b->buf || !b->orig_buf)
 		return;
 
-	if (len == b->len) {
+	free(b->orig_buf);
+	memset(b, 0, sizeof(*b));
+}
+
+void gwbuf_advance(struct gwbuf *b, uint64_t len)
+{
+	if (len >= b->len) {
 		gwbuf_free(b);
 		return;
 	}
 
-	memmove(b->buf, b->buf + len, b->len - len);
 	b->len -= len;
+	memmove(b->buf, &b->buf[len], b->len);
 	b->buf[b->len] = '\0';
 }
 
-int gwbuf_set_cap(struct gwbuf *b, size_t cap)
+void gwbuf_soft_advance(struct gwbuf *b, uint64_t len)
 {
-	char *new_buf;
+	assert(len <= b->len);
+	b->buf += len;
+	b->len -= len;
+}
 
-	if (cap == b->cap)
+void gwbuf_soft_advance_sync(struct gwbuf *b)
+{
+	assert(b->buf >= b->orig_buf);
+	assert(b->cap >= b->len);
+
+	if (!b->len) {
+		gwbuf_free(b);
+		return;
+	}
+
+	memmove(b->orig_buf, b->buf, b->len);
+	b->orig_buf[b->len] = '\0';
+	b->buf = b->orig_buf;
+}
+
+int gwbuf_prepare_need(struct gwbuf *b, uint64_t need)
+{
+	uint64_t needed_len = b->len + need;
+	uint64_t new_cap;
+
+	if (need <= b->cap - b->len)
 		return 0;
 
-	new_buf = realloc(b->buf, cap + 1);
-	if (!new_buf)
-		return -ENOMEM;
+	new_cap = (b->cap + 1ull) * 2ull;
+	while (new_cap < needed_len)
+		new_cap *= 2ull;
 
-	b->buf = new_buf;
-	b->cap = cap;
-	if (b->len > b->cap)
-		b->len = b->cap;
-
-	b->buf[b->len] = b->buf[b->cap] = '\0';
-	return 0;
+	return gwbuf_set_cap(b, new_cap);
 }
 
 int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 {
 	va_list args, args2;
+	uint64_t free_space;
 	int len, ret;
 
 	va_start(args, fmt);
@@ -95,54 +115,36 @@ int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...)
 	len = vsnprintf(NULL, 0, fmt, args2);
 	va_end(args2);
 
-	ret = gwbuf_increase(b, len + 1);
+	ret = gwbuf_prepare_need(b, len + 1);
 	if (ret < 0)
 		goto out;
 
-	ret = vsnprintf(b->buf + b->len, b->cap - b->len + 1, fmt, args);
+	free_space = b->cap - b->len;
+	ret = vsnprintf(&b->buf[b->len], free_space + 1ul, fmt, args);
 	b->len += ret;
-	b->buf[b->len] = '\0';
 	ret = 0;
 out:
 	va_end(args);
 	return ret;
 }
 
-int gwbuf_append(struct gwbuf *b, const void *data, size_t len)
+int gwbuf_append(struct gwbuf *b, const void *data, uint64_t len)
 {
-	static const size_t base_buf = 1023;
+	int ret;
 
-	if (b->len + len > b->cap) {
-		size_t new_cap = b->cap ? b->cap * 2 : base_buf;
-		char *new_buf;
+	ret = gwbuf_prepare_need(b, len);
+	if (ret < 0)
+		return ret;
 
-		if (new_cap < b->len + len)
-			new_cap = b->len + len + base_buf;
-
-		new_buf = realloc(b->buf, new_cap + 1);
-		if (!new_buf)
-			return -ENOMEM;
-
-		b->buf = new_buf;
-		b->cap = new_cap;
-	}
-
-	memcpy(b->buf + b->len, data, len);
+	memcpy(&b->buf[b->len], data, len);
 	b->len += len;
-	b->buf[b->len] = b->buf[b->cap] = '\0';
+	b->buf[b->len] = '\0';
 	return 0;
 }
 
 void gwbuf_move(struct gwbuf *dst, struct gwbuf *src)
 {
-	if (dst->buf)
-		free(dst->buf);
-
-	dst->buf = src->buf;
-	dst->len = src->len;
-	dst->cap = src->cap;
-
-	src->buf = NULL;
-	src->len = 0;
-	src->cap = 0;
+	gwbuf_free(dst);
+	*dst = *src;
+	memset(src, 0, sizeof(*src));
 }

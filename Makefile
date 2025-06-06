@@ -1,4 +1,4 @@
-CFLAGS = -Wall -Wextra -Os -g -fno-strict-aliasing -ffunction-sections \
+CFLAGS = -Wall -Wextra -O2 -g -fno-strict-aliasing -ffunction-sections \
 	-fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector
 LDFLAGS =
 DEPFLAGS = -MMD -MP -MF $@.d
@@ -11,8 +11,18 @@ ifeq ($(SANITIZE),1)
 endif
 
 ifeq ($(LTO),1)
-	CFLAGS += -flto
-	LDFLAGS += -flto
+	CFLAGS += -flto=full
+	LDFLAGS += -flto=full
+endif
+
+ifeq ($(STATIC),1)
+	LDFLAGS += -static
+endif
+
+ifeq ($(RELEASE_MODE),1)
+	CFLAGS += -DNDEBUG
+else
+	CFLAGS += -DDEBUG
 endif
 
 GWHTTPD_CC_OBJ = \

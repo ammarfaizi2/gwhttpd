@@ -597,7 +597,7 @@ static int handle_rx_st_hdr(gwnet_http_cli_t *hc, struct gwbuf *b)
 	req->hpctx.off = 0;
 	r = gwnet_http_req_hdr_parse(&req->hpctx, &req->hdr);
 	if (req->hpctx.off)
-		gwbuf_advance(b, req->hpctx.off);
+		gwbuf_soft_advance(b, req->hpctx.off);
 
 	if (r < 0)
 		return r;
@@ -640,7 +640,7 @@ static int handle_rx_st_body_chunked(struct gwnet_http_req *req,
 		prev_tot_len = bpctx->tot_len;
 		r = gwnet_http_body_parse_chunked(bpctx, dst_buf, to_copy_len);
 		if (bpctx->off)
-			gwbuf_advance(b, bpctx->off);
+			gwbuf_soft_advance(b, bpctx->off);
 
 		copied_len = bpctx->tot_len - prev_tot_len;
 		bb->len += copied_len;
@@ -670,7 +670,7 @@ static int handle_rx_st_body_non_chunked(gwnet_http_cli_t *hc,
 			return r;
 	}
 
-	gwbuf_advance(b, orig_to_copy_len);
+	gwbuf_soft_advance(b, orig_to_copy_len);
 	req->rcon_len -= orig_to_copy_len;
 	return (req->rcon_len > 0) ? -EAGAIN : 0;
 }
@@ -995,6 +995,7 @@ static int gwnet_http_srv_post_recv_cb(void *data, gwnet_tcp_srv_t *s,
 	if (ret == -EAGAIN)
 		ret = 0;
 
+	gwbuf_soft_advance_sync(b);
 	return ret;
 	(void)s;
 	(void)recv_ret;

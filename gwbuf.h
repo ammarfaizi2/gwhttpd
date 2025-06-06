@@ -6,20 +6,24 @@
 #define GWBUF_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 struct gwbuf {
-	char	*buf;
-	size_t	len;
-	size_t	cap;
+	char		*buf;
+	uint64_t	len;
+	uint64_t	cap;
+	char		*orig_buf;
 };
 
-int gwbuf_init(struct gwbuf *b, size_t cap);
-int gwbuf_increase(struct gwbuf *b, size_t inc);
+int gwbuf_init(struct gwbuf *b, uint64_t cap);
+int gwbuf_increase(struct gwbuf *b, uint64_t inc);
 void gwbuf_free(struct gwbuf *b);
-void gwbuf_advance(struct gwbuf *b, size_t len);
-int gwbuf_set_cap(struct gwbuf *b, size_t cap);
+void gwbuf_advance(struct gwbuf *b, uint64_t len);
+void gwbuf_soft_advance(struct gwbuf *b, uint64_t len);
+void gwbuf_soft_advance_sync(struct gwbuf *b);
+int gwbuf_prepare_need(struct gwbuf *b, uint64_t need);
 int gwbuf_apfmt(struct gwbuf *b, const char *fmt, ...);
-int gwbuf_append(struct gwbuf *b, const void *data, size_t len);
+int gwbuf_append(struct gwbuf *b, const void *data, uint64_t len);
 void gwbuf_move(struct gwbuf *dst, struct gwbuf *src);
 
 #endif /* #ifndef GWBUF_H */

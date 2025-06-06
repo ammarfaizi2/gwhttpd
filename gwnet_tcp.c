@@ -55,8 +55,9 @@ struct gwnet_tcp_cli {
 	struct gwsockaddr		addr;
 	struct gwnet_tcp_buf		tx_buf;
 	struct gwnet_tcp_buf		rx_buf;
-	uint32_t			ep_mask;
 	uint64_t			conn_id;
+	uint32_t			ep_mask;
+	uint32_t			idx;
 
 	gwnet_tcp_cli_pre_recv_t	pre_recv_cb;
 	gwnet_tcp_cli_post_recv_t	post_recv_cb;
@@ -65,7 +66,6 @@ struct gwnet_tcp_cli {
 	gwnet_tcp_cli_free_t		free_cb;
 	void				*udata;
 	struct gwnet_tcp_srv		*ctx;
-	uint32_t			idx;
 };
 
 struct gwstack32 {
@@ -675,10 +675,8 @@ static int __gwnet_tcp_srv_handle_accept(struct gwnet_tcp_srv_wrk *w)
 
 	ctx = w->ctx;
 	ret = gwnet_tcp_srv_get_client(ctx, &c);
-	if (unlikely(ret)) {
-		printf("run out of client slot!\n");
+	if (unlikely(ret))
 		return gwnet_tcp_srv_handle_accept_err(w, -ENFILE);
-	}
 
 	sa = (struct sockaddr *)&addr;
 	fd = accept4(ctx->fd, sa, &ctx->addr_len, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -774,8 +772,8 @@ static int gwnet_tcp_buf_get_rx_ptrnlen(struct gwnet_tcp_cli *c,
 	} else if (b->type == GWNET_TCP_BUF_DEFAULT) {
 		size_t len = b->buf.cap - b->buf.len;
 
-		if (!len) {
-			if (gwbuf_increase(&b->buf, 1023) < 0)
+		if (len < 1024) {
+			if (gwbuf_prepare_need(&b->buf, 1024) < 0)
 				return -ENOMEM;
 
 			len = b->buf.cap - b->buf.len;
@@ -870,7 +868,7 @@ static ssize_t gwnet_tcp_srv_do_recv(struct gwnet_tcp_cli *c)
 		return -ECONNRESET;
 
 	gwnet_tcp_buf_process_rx(c, ret);
-	return ret;
+	return ((size_t)ret != len) ? -EAGAIN : ret;
 }
 
 static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
@@ -899,21 +897,25 @@ static ssize_t gwnet_tcp_srv_do_send(struct gwnet_tcp_cli *c)
 static int gwnet_tcp_srv_handle_client_in(struct epoll_event *ev,
 					  struct gwnet_tcp_cli *c)
 {
+	uint32_t i = 0;
 	size_t tx_len;
 	ssize_t ret;
 	void *buf;
 
-	ret = gwnet_tcp_srv_do_recv(c);
-	if (ret < 0) {
-		if (ret != -EAGAIN && ret != -EINTR)
-			return ret;
+	while (i++ < 32) {
+		ret = gwnet_tcp_srv_do_recv(c);
+		if (ret < 0) {
+			if (ret != -EAGAIN && ret != -EINTR)
+				return ret;
+		}
 
-		ret = 0;
-	}
+		if (!gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &tx_len, false)) {
+			if (tx_len > 0)
+				ev->events |= EPOLLOUT;
+		}
 
-	if (!gwnet_tcp_buf_get_tx_ptrnlen(c, &buf, &tx_len, false)) {
-		if (tx_len > 0)
-			ev->events |= EPOLLOUT;
+		if (ret == -EAGAIN)
+			break;
 	}
 
 	return 0;
@@ -998,6 +1000,7 @@ static int gwnet_tcp_srv_handle_event(struct gwnet_tcp_srv_wrk *w,
 
 	switch (ev_type) {
 	case GWNET_EPL_EV_ACCEPT:
+		ret = gwnet_tcp_srv_handle_accept(w);
 		break;
 	case GWNET_EPL_EV_EVENTFD:
 		ret = gwnet_tcp_srv_handle_eventfd(w);
@@ -1017,24 +1020,6 @@ static int gwnet_tcp_srv_handle_events(int nr_events,
 				       struct gwnet_tcp_srv_wrk *w)
 {
 	int ret = 0, i;
-
-	if (w->id == 0) {
-		bool has_accept_event = false;
-
-		for (i = 0; i < nr_events; i++) {
-			struct epoll_event *ev = &w->events[i];
-			if (ev->data.u64 == GWNET_EPL_EV_ACCEPT) {
-				has_accept_event = true;
-				break;
-			}
-		}
-
-		if (has_accept_event) {
-			ret = gwnet_tcp_srv_handle_accept(w);
-			if (unlikely(ret))
-				return ret;
-		}
-	}
 
 	for (i = 0; i < nr_events; i++) {
 		struct epoll_event *ev = &w->events[i];
