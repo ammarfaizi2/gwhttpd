@@ -664,7 +664,7 @@ loop:
 	if (x->off)
 		gwbuf_soft_advance(b, x->off);
 
-	if (!req->is_body_oversized) {
+	if (to_copy) {
 		copied = x->tot_len - prev_tot_len;
 		bb->len += copied;
 	}
