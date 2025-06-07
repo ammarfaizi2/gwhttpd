@@ -73,8 +73,11 @@ static void show_help(const char *app)
 	printf("  -t, --tcp-backlog <num>       TCP backlog size (default: %d)\n", tc->tcp_backlog);
 	printf("  -H, --max-req-hdr-len <len>   Maximum request header length (default: %u)\n", hc->max_req_hdr_len);
 	printf("  -B, --max-req-body-len <len>  Maximum request body length (default: %llu)\n", (unsigned long long)hc->max_req_body_len);
+
 	printf("  -h, --help                    Show this help message and exit\n");
+#ifdef GWNET_HTTP1_TESTS
 	printf("  --run-tests                   Run tests and exit\n");
+#endif
 	printf("\n");
 }
 
