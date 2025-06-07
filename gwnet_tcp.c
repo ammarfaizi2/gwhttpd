@@ -670,7 +670,7 @@ static int handle_accept_opts(int fd)
 __hot
 static int __handle_accept(struct gwnet_tcp_srv_wrk *w)
 {
-	static int flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
+	static const int flags = SOCK_CLOEXEC | SOCK_NONBLOCK;
 	struct sockaddr_storage addr;
 	struct gwnet_tcp_srv *ctx;
 	struct gwnet_tcp_cli *c;
