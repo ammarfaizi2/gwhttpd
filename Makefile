@@ -1,5 +1,6 @@
 CFLAGS = -Wall -Wextra -Os -g -fno-strict-aliasing -ffunction-sections \
-	-fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector
+	-fdata-sections -fvisibility=hidden -std=gnu99 -fno-stack-protector \
+	-D_GNU_SOURCE
 LDFLAGS =
 DEPFLAGS = -MMD -MP -MF $@.d
 LIBS = -lpthread
