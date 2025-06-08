@@ -642,27 +642,28 @@ __hot
 static int handle_accept_opts(int fd)
 {
 	int r = 0, v;
+	static const size_t l = sizeof(v);
 
 	v = 1;
-	r |= __sys_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v, sizeof(v));
+	r |= __sys_setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v, l);
 
 	/*
 	 * Wait 5 seconds before sending the first probe.
 	 */
 	v = 5;
-	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, sizeof(v));
+	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &v, l);
 
 	/*
 	 * Then every 5 seconds send a probe.
 	 */
 	v = 3;
-	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, sizeof(v));
+	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &v, l);
 
 	/*
 	 * Give up after 3 unanswered probes.
 	 */
 	v = 3;
-	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, sizeof(v));
+	r |= __sys_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &v, l);
 
 	return r;
 }
