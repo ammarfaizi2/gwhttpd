@@ -234,7 +234,7 @@ struct gwnet_http_res *gwnet_http_req_get_res(gwnet_http_req_t *req)
 	return &req->res;
 }
 
-void gwnet_http_res_set_code(gwnet_http_res_t *res, uint8_t code)
+void gwnet_http_res_set_code(gwnet_http_res_t *res, uint16_t code)
 {
 	res->status = code;
 }
