@@ -93,4 +93,6 @@ struct gwnet_http_hdr_fields *gwnet_http_res_get_hdr_fields(
 struct gwnet_http_req_hdr_fields *gwnet_http_req_get_hdr_fields(
 						gwnet_http_req_t *req);
 
+struct gwnet_http_req_hdr *gwnet_http_req_get_hdr(gwnet_http_req_t *req);
+
 #endif /* #ifndef GWNET_HTTP_H */

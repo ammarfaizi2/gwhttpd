@@ -190,6 +190,11 @@ static const char *translate_http_code(uint16_t code)
 	}
 }
 
+struct gwnet_http_req_hdr *gwnet_http_req_get_hdr(gwnet_http_req_t *req)
+{
+	return &req->hdr;
+}
+
 void gwnet_http_srv_set_data_cb(gwnet_http_srv_t *srv, void *data)
 {
 	srv->data_cb = data;
