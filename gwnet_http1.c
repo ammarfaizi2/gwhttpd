@@ -200,9 +200,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	};
 	static const size_t nr_methods = sizeof(methods) / sizeof(methods[0]);
 	size_t i, cmpl, reml, off = 0, len = ctx->len - ctx->off;
-	const char *uri, *qs, *buf = &ctx->buf[ctx->off];
+	const char *uri, *qs, *path, *buf = &ctx->buf[ctx->off];
+	uint32_t uri_len, qs_len, path_len;
 	uint8_t method_code, version_code;
-	uint32_t uri_len, qs_len;
 
 	if (!len)
 		return -EAGAIN;
@@ -266,10 +266,9 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 			return -EINVAL;
 	}
 
-	uri = &buf[off];
+	path = uri = &buf[off];
 	qs = NULL;
-	uri_len = 0;
-	qs_len = 0;
+	path_len = uri_len = qs_len = 0;
 
 	/*
 	 * Keep going until we find a space character.
@@ -292,13 +291,17 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 		uri_len++;
 		if (qs)
 			qs_len++;
+		else
+			path_len++;
 
 		/*
 		 * If we find a question mark, start assigning the
 		 * the query string.
 		 */
-		if (c == '?')
+		if (c == '?') {
 			qs = &buf[off];
+			path_len--;
+		}
 	}
 
 	/*
@@ -364,28 +367,40 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (ctx->tot_len + off >= ctx->max_len)
 		return -E2BIG;
 
-	hdr->uri = malloc(uri_len + 1);
-	if (!hdr->uri)
+	hdr->path = malloc(path_len + 1);
+	if (unlikely(!hdr->path))
 		return -ENOMEM;
+
+	hdr->uri = malloc(uri_len + 1);
+	if (unlikely(!hdr->uri))
+		goto free_path;
 
 	if (qs_len) {
 		hdr->qs = malloc(qs_len + 1);
-		if (!hdr->qs) {
-			free(hdr->uri);
-			hdr->uri = NULL;
-			return -ENOMEM;
-		}
+		if (unlikely(!hdr->qs))
+			goto free_uri;
 		memcpy(hdr->qs, qs, qs_len);
 		hdr->qs[qs_len] = '\0';
 	}
 
+	memcpy(hdr->path, path, path_len);
+	hdr->path[path_len] = '\0';
 	memcpy(hdr->uri, uri, uri_len);
 	hdr->uri[uri_len] = '\0';
+
 	hdr->method = method_code;
 	hdr->version = version_code;
 	ctx->off += off;
 	ctx->tot_len += off;
 	return 0;
+
+free_uri:
+	free(hdr->uri);
+	hdr->uri = NULL;
+free_path:
+	free(hdr->path);
+	hdr->path = NULL;
+	return -ENOMEM;
 }
 
 /**
@@ -852,6 +867,7 @@ void gwnet_http_req_hdr_free(struct gwnet_http_req_hdr *hdr)
 	if (!hdr)
 		return;
 
+	free(hdr->path);
 	free(hdr->uri);
 	free(hdr->qs);
 	gwnet_http_hdr_fields_free(&hdr->fields);
