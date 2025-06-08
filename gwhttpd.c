@@ -256,12 +256,13 @@ rt_index(gwnet_http_req_t *req)
 		"</html>\n";
 
 	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
-	struct gwbuf b;
-	memset(&b, 0, sizeof(b));
+	struct gwbuf b = { };
+
+	if (gwbuf_append(&b, html, sizeof(html) - 1))
+		return -ENOMEM;
 
 	gwnet_http_res_set_code(res, 200);
 	gwnet_http_res_set_content_type(res, "text/html; charset=UTF-8");
-	gwbuf_append(&b, html, sizeof(html) - 1);
 	gwnet_http_res_body_set_buf(res, &b);
 	return 0;
 }
@@ -271,12 +272,13 @@ rt_404(gwnet_http_req_t *req)
 {
 	static const char msg[] = "404 Not Found\n";
 	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
-	struct gwbuf b;
+	struct gwbuf b = { };
 
-	memset(&b, 0, sizeof(b));
+	if (gwbuf_append(&b, msg, sizeof(msg) - 1))
+		return -ENOMEM;
+
 	gwnet_http_res_set_code(res, 404);
 	gwnet_http_res_set_content_type(res, "text/plain; charset=UTF-8");
-	gwbuf_append(&b, msg, sizeof(msg) - 1);
 	gwnet_http_res_body_set_buf(res, &b);
 	return 0;
 }
@@ -293,6 +295,8 @@ rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
 
 	return rt_404(req);
 	(void)data;
+	(void)s;
+	(void)c;
 }
 
 static int
