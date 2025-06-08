@@ -305,6 +305,15 @@ static int parse_hdr_req_first_line(struct gwnet_http_hdr_pctx *ctx,
 	}
 
 	/*
+	 * Trim trailing slashes from the path.
+	 */
+	while (path[path_len - 1] == '/') {
+		if (path_len == 1)
+			break; /* Keep at least one slash. */
+		path_len--;
+	}
+
+	/*
 	 * Keep going until we find a non-space character.
 	 */
 	while (is_space(buf[off])) {
