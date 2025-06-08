@@ -6,6 +6,7 @@
 #define GWNET_HTTP_DEFINE_SHORT_NAMES
 #include "gwnet_http.h"
 #include "gwbuf.h"
+#include "common.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -283,6 +284,7 @@ rt_404(gwnet_http_req_t *req)
 	return 0;
 }
 
+__hot
 static int
 rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
       gwnet_http_req_t *req)
@@ -299,6 +301,7 @@ rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
 	(void)c;
 }
 
+__hot
 static int
 accept_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c)
 {
