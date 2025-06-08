@@ -98,12 +98,16 @@ void gwbuf_soft_advance_sync(struct gwbuf *b)
 __hot
 int gwbuf_prepare_need(struct gwbuf *b, uint64_t need)
 {
-	uint64_t needed_len = b->len + need;
+	uint64_t needed_len;
 	uint64_t new_cap;
+
+	if (b->orig_buf != b->buf)
+		gwbuf_soft_advance_sync(b);
 
 	if (need <= b->cap - b->len)
 		return 0;
 
+	needed_len = b->len + need;
 	new_cap = (b->cap + 1ull) * 2ull;
 	while (new_cap < needed_len)
 		new_cap *= 2ull;
