@@ -856,9 +856,9 @@ static ssize_t gwnet_tcp_buf_adv_tx(struct gwnet_tcp_cli *c, ssize_t len)
 __hot
 static ssize_t do_recv(struct gwnet_tcp_cli *c)
 {
+	char *buf = NULL;
+	size_t len = 0;
 	ssize_t ret;
-	size_t len;
-	char *buf;
 
 	ret = buf_get_rx_ptrnlen(c, (void **)&buf, &len, true);
 	if (ret < 0)
@@ -881,9 +881,9 @@ static ssize_t do_recv(struct gwnet_tcp_cli *c)
 __hot
 static ssize_t do_send(struct gwnet_tcp_cli *c)
 {
+	void *buf = NULL;
+	size_t len = 0;
 	ssize_t ret;
-	size_t len;
-	void *buf;
 
 	ret = buf_get_tx_ptrnlen(c, &buf, &len, true);
 	if (ret < 0)
