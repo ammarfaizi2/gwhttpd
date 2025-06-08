@@ -72,14 +72,6 @@ void gwbuf_advance(struct gwbuf *b, uint64_t len)
 }
 
 __hot
-void gwbuf_soft_advance(struct gwbuf *b, uint64_t len)
-{
-	assert(len <= b->len);
-	b->buf += len;
-	b->len -= len;
-}
-
-__hot
 void gwbuf_soft_advance_sync(struct gwbuf *b)
 {
 	assert(b->buf >= b->orig_buf);
