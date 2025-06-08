@@ -63,6 +63,7 @@ struct gwnet_http_hdr_fields {
 struct gwnet_http_req_hdr {
 	uint8_t		method;
 	uint8_t		version;
+	char		*path;
 	char		*uri;
 	char		*qs;
 

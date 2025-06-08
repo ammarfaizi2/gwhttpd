@@ -75,7 +75,7 @@ void gwnet_http_cli_set_rt_on_body_cb(gwnet_http_cli_t *hc,
 
 struct gwnet_http_res *gwnet_http_req_get_res(gwnet_http_req_t *req);
 
-void gwnet_http_res_set_code(gwnet_http_res_t *res, uint8_t code);
+void gwnet_http_res_set_code(gwnet_http_res_t *res, uint16_t code);
 void gwnet_http_res_set_content_type(gwnet_http_res_t *res,
 				     const char *content_type);
 void gwnet_http_res_body_set_zero(gwnet_http_res_t *res, uint64_t len);
@@ -92,5 +92,7 @@ struct gwnet_http_hdr_fields *gwnet_http_res_get_hdr_fields(
 
 struct gwnet_http_req_hdr_fields *gwnet_http_req_get_hdr_fields(
 						gwnet_http_req_t *req);
+
+struct gwnet_http_req_hdr *gwnet_http_req_get_hdr(gwnet_http_req_t *req);
 
 #endif /* #ifndef GWNET_HTTP_H */

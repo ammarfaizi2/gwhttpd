@@ -6,6 +6,7 @@
 #define GWNET_HTTP_DEFINE_SHORT_NAMES
 #include "gwnet_http.h"
 #include "gwbuf.h"
+#include "common.h"
 
 #include <stdio.h>
 #include <errno.h>
@@ -62,7 +63,7 @@ static void show_help(const char *app)
 	const struct gwnet_http_srv_cfg *hc = &default_cfg;
 
 	printf("Usage: %s [OPTIONS]\n", app);
-	printf("gwhttpd2 - A simple HTTP server\n");
+	printf("gwhttpd - A simple HTTP server\n");
 	printf("\n");
 	printf("Options:\n");
 	printf("  -b, --bind-addr <addr>        Bind address (default: %s)\n", tc->bind_addr);
@@ -240,73 +241,76 @@ static int parse_arg_and_init(int argc, char *argv[], gwnet_http_srv_t **srv_p)
 	return 0;
 }
 
-#if 0
-struct rt_ctx {
-	struct gwnet_http_srv *srv;
-	struct gwnet_http_cli *hc;
-	struct gwnet_http_req *req;
-	struct gwnet_http_res *res;
-};
-
-static int route_hello_world(struct rt_ctx *ctx)
+static int
+rt_index(gwnet_http_req_t *req)
 {
-	struct gwnet_http_res *res = ctx->res;
-	struct gwbuf *b = hres_get_body_buf(res);
+	static const char html[] =
+		"<!DOCTYPE html>\n"
+		"<html lang=\"en\">\n"
+		"<head>\n"
+		"	<meta charset=\"UTF-8\"/>\n"
+		"</head>\n"
+		"<body>\n"
+		"	<h1>Welcome to gwhttpd!</h1>\n"
+		"	<p>This is a simple HTTP server implementation.</p>\n"
+		"</body>\n"
+		"</html>\n";
 
-	hres_set_content_type(res, "text/plain");
-	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_BUF);
-	gwbuf_apfmt(b, "Hello world!\n");
-	hres_set_code(res, 200);
+	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
+	struct gwbuf b = { };
+
+	if (gwbuf_append(&b, html, sizeof(html) - 1))
+		return -ENOMEM;
+
+	gwnet_http_res_set_code(res, 200);
+	gwnet_http_res_set_content_type(res, "text/html; charset=UTF-8");
+	gwnet_http_res_body_set_buf(res, &b);
 	return 0;
 }
 
-static int route_zero(struct rt_ctx *ctx)
+static int
+rt_404(gwnet_http_req_t *req)
 {
-	struct gwnet_http_res *res = hres_get(ctx->hc);
+	static const char msg[] = "404 Not Found\n";
+	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
+	struct gwbuf b = { };
 
-	hres_set_content_type(res, "application/octet-stream");
-	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_ZERO);
-	hres_set_zero_len(res, 1024ull * 1024 * 1024 * 30);
-	hres_set_code(res, 200);
+	if (gwbuf_append(&b, msg, sizeof(msg) - 1))
+		return -ENOMEM;
+
+	gwnet_http_res_set_code(res, 404);
+	gwnet_http_res_set_content_type(res, "text/plain; charset=UTF-8");
+	gwnet_http_res_body_set_buf(res, &b);
 	return 0;
 }
 
-static int route_404(struct rt_ctx *ctx)
+__hot
+static int
+rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
+      gwnet_http_req_t *req)
 {
-	struct gwnet_http_res *res = ctx->res;
+	struct gwnet_http_req_hdr *hdr = gwnet_http_req_get_hdr(req);
+	const char *path = hdr->path;
 
-	hres_set_content_type(res, "text/plain");
-	gwnet_http_res_set_type(res, GWNET_HTTP_RES_TYPE_BUF);
-	gwbuf_apfmt(hres_get_body_buf(res), "404 Not Found\n");
-	hres_set_code(res, 404);
+	if (!strcmp("/", path))
+		return rt_index(req);
+
+	return rt_404(req);
+	(void)data;
+	(void)s;
+	(void)c;
+}
+
+__hot
+static int
+accept_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c)
+{
+	gwnet_http_cli_set_data_cb(c, data);
+	gwnet_http_cli_set_rt_cb(c, &rt_cb);
 	return 0;
+
+	(void)s;
 }
-
-static int handle_route(struct gwnet_http_srv *srv, struct gwnet_http_cli *hc)
-{
-	struct gwnet_http_req *req = hreq_get(hc);
-	struct gwnet_http_res *res = hres_get(hc);
-	struct rt_ctx ctx = {
-		.srv = srv,
-		.hc = hc,
-		.req = req,
-		.res = res,
-	};
-	char *uri = hreq_get_nc_uri(req);
-
-	if (!uri)
-		return -EINVAL;
-
-	uri = trim_char(uri, '/');
-	if (!*uri)
-		return route_hello_world(&ctx);
-
-	if (!strcmp(uri, "zero"))
-		return route_zero(&ctx);
-
-	return route_404(&ctx);
-}
-#endif
 
 int main(int argc, char *argv[])
 {
@@ -317,6 +321,8 @@ int main(int argc, char *argv[])
 	if (ret)
 		return -ret;
 
+	gwnet_http_srv_set_accept_cb(srv, &accept_cb);
+	gwnet_http_srv_set_data_cb(srv, NULL);
 	ret = gwnet_http_srv_run(srv);
 	gwnet_http_srv_free(srv);
 	return -ret;
