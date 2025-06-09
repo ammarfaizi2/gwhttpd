@@ -284,6 +284,29 @@ rt_404(gwnet_http_req_t *req)
 	return 0;
 }
 
+static int
+rt_zero(gwnet_http_req_t *req)
+{
+	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
+
+	gwnet_http_res_set_code(res, 200);
+	gwnet_http_res_set_content_type(res, "application/octet-stream");
+	gwnet_http_res_body_set_zero(res, 1024ull*1024ull*1024ull*10ull);
+	return 0;
+}
+
+static int
+rt_urandom(gwnet_http_req_t *req)
+{
+	gwnet_http_res_t *res = gwnet_http_req_get_res(req);
+	int r;
+
+	gwnet_http_res_set_code(res, 200);
+	gwnet_http_res_set_content_type(res, "application/octet-stream");
+	r = gwnet_http_res_body_set_urandom(res, 1024ull*1024ull*1024ull*10ull);
+	return r;
+}
+
 __hot
 static int
 rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
@@ -294,6 +317,12 @@ rt_cb(void *data, gwnet_http_srv_t *s, gwnet_http_cli_t *c,
 
 	if (!strcmp("/", path))
 		return rt_index(req);
+
+	if (!strcmp("/zero", path))
+		return rt_zero(req);
+
+	if (!strcmp("/urandom", path))
+		return rt_urandom(req);
 
 	return rt_404(req);
 	(void)data;

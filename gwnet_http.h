@@ -79,7 +79,7 @@ void gwnet_http_res_set_code(gwnet_http_res_t *res, uint16_t code);
 void gwnet_http_res_set_content_type(gwnet_http_res_t *res,
 				     const char *content_type);
 void gwnet_http_res_body_set_zero(gwnet_http_res_t *res, uint64_t len);
-void gwnet_http_res_body_set_urandom(gwnet_http_res_t *res, uint64_t len);
+int gwnet_http_res_body_set_urandom(gwnet_http_res_t *res, uint64_t len);
 void gwnet_http_res_body_set_file(gwnet_http_res_t *res, int fd,
 				  uint64_t len);
 int gwnet_http_res_body_set_file_path(gwnet_http_res_t *res,

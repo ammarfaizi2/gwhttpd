@@ -25,7 +25,7 @@
 
 #include "common.h"
 
-#define GWNET_HTTP_SEND_BUF		4096
+#define GWNET_HTTP_SEND_BUF		8192
 
 enum {
 	GWNET_HTTP_TX_ST_INIT		= 0,
@@ -49,6 +49,7 @@ struct gwnet_http_res_body_zero {
 };
 
 struct gwnet_http_res_body_urandom {
+	int		fd;
 	uint64_t	ur_len;
 	uint64_t	ur_off;
 };
@@ -268,6 +269,10 @@ static void gwnet_http_res_body_free(struct gwnet_http_res_body *b)
 	case GWNET_HTTP_RES_TYPE_URANDOM:
 		b->urandom.ur_len = 0;
 		b->urandom.ur_off = 0;
+		if (b->urandom.fd >= 0) {
+			__sys_close(b->urandom.fd);
+			b->urandom.fd = -1;
+		}
 		break;
 	case GWNET_HTTP_RES_TYPE_FILE:
 		if (b->file.fd >= 0) {
@@ -294,12 +299,18 @@ void gwnet_http_res_body_set_zero(gwnet_http_res_t *res, uint64_t len)
 	res->body.zero.zero_off = 0;
 }
 
-void gwnet_http_res_body_set_urandom(gwnet_http_res_t *res, uint64_t len)
+int gwnet_http_res_body_set_urandom(gwnet_http_res_t *res, uint64_t len)
 {
+	int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+
 	gwnet_http_res_body_free(&res->body);
 	res->body.type = GWNET_HTTP_RES_TYPE_URANDOM;
 	res->body.urandom.ur_len = len;
 	res->body.urandom.ur_off = 0;
+	res->body.urandom.fd = fd;
+	return 0;
 }
 
 void gwnet_http_res_body_set_file(gwnet_http_res_t *res, int fd,
@@ -317,24 +328,27 @@ int gwnet_http_res_body_set_file_path(gwnet_http_res_t *res,
 {
 	struct stat st;
 	int ret, fd;
-
+	
 	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -errno;
 
 	if (fstat(fd, &st) < 0) {
 		ret = -errno;
-		close(fd);
-		return ret;
+		goto out_err;
 	}
 
 	if (!S_ISREG(st.st_mode)) {
-		close(fd);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_err;
 	}
 
 	gwnet_http_res_body_set_file(res, fd, st.st_size);
 	return 0;
+
+out_err:
+	__sys_close(fd);
+	return ret;
 }
 
 void gwnet_http_res_body_set_buf(gwnet_http_res_t *res, struct gwbuf *buf)
@@ -913,6 +927,100 @@ static int handle_tx_hdr(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
 	return 1;
 }
 
+static int handle_tx_body_buf(struct gwnet_http_cli *hc,
+			      struct gwnet_http_req *req, struct gwbuf *b)
+{
+	struct gwnet_http_res *res = &req->res;
+	struct gwnet_http_res_body *body = &res->body;
+	struct gwbuf *bb = &body->buf.buf;
+	uint64_t to_copy;
+	int r;
+
+	to_copy = min_st(GWNET_HTTP_SEND_BUF, bb->len);
+	r = gwbuf_append(b, bb->buf, to_copy);
+	if (unlikely(r < 0))
+		return -ENOMEM;
+
+	gwbuf_advance(bb, to_copy);
+	if (bb->len == 0) {
+		hc->tx_state = GWNET_HTTP_TX_ST_DONE;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int handle_tx_body_zero(struct gwnet_http_cli *hc,
+			       struct gwnet_http_req *req, struct gwbuf *b)
+{
+	struct gwnet_http_res *res = &req->res;
+	struct gwnet_http_res_body *body = &res->body;
+	struct gwnet_http_res_body_zero *z = &body->zero;
+	uint64_t to_copy;
+	int r;
+
+	if (b->cap < GWNET_HTTP_SEND_BUF) {
+		r = gwbuf_increase(b, GWNET_HTTP_SEND_BUF - b->cap);
+		if (unlikely(r < 0))
+			return -ENOMEM;
+	}
+
+	to_copy = min_st(GWNET_HTTP_SEND_BUF, b->cap - b->len);
+	to_copy = min_st(to_copy, z->zero_len - z->zero_off);
+	r = gwbuf_prepare_need(b, to_copy);
+	if (unlikely(r < 0))
+		return -ENOMEM;
+
+	memset(&b->buf[b->len], 0, to_copy);
+	b->len += to_copy;
+	z->zero_off += to_copy;
+
+	if (z->zero_off >= z->zero_len) {
+		assert(z->zero_off == z->zero_len);
+		hc->tx_state = GWNET_HTTP_TX_ST_DONE;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int handle_tx_body_urandom(struct gwnet_http_cli *hc,
+				  struct gwnet_http_req *req, struct gwbuf *b)
+{
+	struct gwnet_http_res *res = &req->res;
+	struct gwnet_http_res_body *body = &res->body;
+	struct gwnet_http_res_body_urandom *ur = &body->urandom;
+	uint64_t to_copy;
+	int r;
+
+	if (b->cap < GWNET_HTTP_SEND_BUF) {
+		r = gwbuf_increase(b, GWNET_HTTP_SEND_BUF - b->cap);
+		if (unlikely(r < 0))
+			return -ENOMEM;
+	}
+
+	to_copy = min_st(GWNET_HTTP_SEND_BUF, b->cap - b->len);
+	to_copy = min_st(to_copy, ur->ur_len - ur->ur_off);
+	r = gwbuf_prepare_need(b, to_copy);
+	if (unlikely(r < 0))
+		return -ENOMEM;
+
+	r = __sys_read(ur->fd, &b->buf[b->len], to_copy);
+	if (unlikely(r < 0))
+		return r;
+
+	b->len += r;
+	ur->ur_off += r;
+
+	if (ur->ur_off >= ur->ur_len) {
+		assert(ur->ur_off == ur->ur_len);
+		hc->tx_state = GWNET_HTTP_TX_ST_DONE;
+		return 1;
+	}
+
+	return 0;
+}
+
 __hot
 static int handle_tx_body(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
 			  struct gwbuf *b)
@@ -926,15 +1034,14 @@ static int handle_tx_body(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
 		hc->tx_state = GWNET_HTTP_TX_ST_DONE;
 		return 1;
 	case GWNET_HTTP_RES_TYPE_BUF:
-		r = gwbuf_append(b, body->buf.buf.buf, body->buf.buf.len);
-		if (!r) {
-			gwbuf_advance(&body->buf.buf, body->buf.buf.len);
-			hc->tx_state = GWNET_HTTP_TX_ST_DONE;
-			return 1;
-		}
+		r = handle_tx_body_buf(hc, req, b);
 		break;
 	case GWNET_HTTP_RES_TYPE_ZERO:
+		r = handle_tx_body_zero(hc, req, b);
+		break;
 	case GWNET_HTTP_RES_TYPE_URANDOM:
+		r = handle_tx_body_urandom(hc, req, b);
+		break;
 	case GWNET_HTTP_RES_TYPE_FILE:
 		return -EINVAL;
 	default:
@@ -1068,11 +1175,16 @@ static int gwnet_http_srv_post_send_cb(void *data, gwnet_tcp_srv_t *s,
 	struct gwnet_http_cli *hc = data;
 	struct gwnet_tcp_buf *tb = gwnet_tcp_srv_cli_get_tx_buf(c);
 	struct gwbuf *b = &tb->buf;
+	struct gwnet_http_req *req;
 
 	if (hc->stop_receiving && !b->len)
 		return -ECONNRESET;
 
-	return 0;
+	req = gwnet_http_srv_cli_req_head(hc);
+	if (unlikely(!req))
+		return 0;
+
+	return __handle_tx(hc, req, b);
 	(void)s;
 	(void)send_ret;
 }
