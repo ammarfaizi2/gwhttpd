@@ -930,20 +930,29 @@ static int handle_client_out(struct gwnet_tcp_srv_wrk *w,
 {
 	struct epoll_event ev_out;
 	bool need_epctl = false;
+	uint32_t i = 0;
 	size_t tx_len;
 	ssize_t ret;
 	void *buf;
 
-	ret = do_send(c);
-	if (ret < 0) {
-		if (ret != -EAGAIN && ret != -EINTR)
+	do {
+		/*
+		 * Reduce roundtrip latency to `epoll_wait()` by
+		 * repeatedly calling `send()` while tx_buf has
+		 * data. Limit to 8 iterations to prevent starving
+		 * other clients. It's very useful when the buffer
+		 * is large, like sending a file.
+		 */
+		ret = do_send(c);
+		if (ret < 0) {
+			if (ret != -EAGAIN && ret != -EINTR)
+				return ret;
+		}
+
+		ret = buf_get_tx_ptrnlen(c, &buf, &tx_len, false);
+		if (unlikely(ret < 0))
 			return ret;
-
-		ret = 0;
-	}
-
-	if (buf_get_tx_ptrnlen(c, &buf, &tx_len, false))
-		return 0;
+	} while (i++ <= 8 && tx_len > 0);
 
 	if (tx_len == 0 && (c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLIN;
