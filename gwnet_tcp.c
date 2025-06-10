@@ -929,13 +929,15 @@ static int handle_client_out(struct gwnet_tcp_srv_wrk *w,
 			     struct gwnet_tcp_cli *c)
 {
 	struct epoll_event ev_out;
-	bool need_epctl = false;
+	bool need_epctl;
 	uint32_t i = 0;
 	size_t tx_len;
 	ssize_t ret;
 	void *buf;
 
 	do {
+		int ret2;
+
 		/*
 		 * Reduce roundtrip latency to `epoll_wait()` by
 		 * repeatedly calling `send()` while tx_buf has
@@ -949,9 +951,21 @@ static int handle_client_out(struct gwnet_tcp_srv_wrk *w,
 				return ret;
 		}
 
-		ret = buf_get_tx_ptrnlen(c, &buf, &tx_len, false);
-		if (unlikely(ret < 0))
-			return ret;
+		ret2 = buf_get_tx_ptrnlen(c, &buf, &tx_len, false);
+		if (unlikely(ret2 < 0))
+			return ret2;
+
+		if (ret == -EAGAIN) {
+			/*
+			 * If we hit -EAGAIN, the next send will
+			 * likely fail with -EAGAIN again or a
+			 * short-send. It's better to wait for
+			 * the EPOLLOUT event to come rather
+			 * than wasting CPU cycles here.
+			 */
+			break;
+		}
+
 	} while (i++ <= 8 && tx_len > 0);
 
 	if (tx_len == 0 && (c->ep_mask & EPOLLOUT)) {
@@ -960,6 +974,8 @@ static int handle_client_out(struct gwnet_tcp_srv_wrk *w,
 	} else if (tx_len > 0 && !(c->ep_mask & EPOLLOUT)) {
 		ev_out.events = EPOLLOUT | EPOLLIN;
 		need_epctl = true;
+	} else {
+		need_epctl = false;
 	}
 
 	if (need_epctl) {
