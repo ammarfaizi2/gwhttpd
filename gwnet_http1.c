@@ -472,13 +472,12 @@ static int parse_hdr_res_first_line(struct gwnet_http_hdr_pctx *ctx,
 	if (!is_space(buf[off]))
 		return -EINVAL;
 
-	/*
-	 * Keep going until we find a non-space character.
-	 */
-	while (is_space(buf[off])) {
-		if (++off >= len)
-			return -EAGAIN;
-	}
+	off++;
+	if (ctx->tot_len + off >= ctx->max_len)
+		return -E2BIG;
+	if (off >= len)
+		return -EAGAIN;
+
 
 	/*
 	 * Parse the HTTP response code. It must be a 3-digit number
@@ -1445,7 +1444,7 @@ static void test_req_hdr_query_string_empty(void)
 
 static void test_req_hdr_invalid_req_line_sp(void)
 {
-		static const char buf[] =
+	static const char buf[] =
 		"GET   /index.html         HTTP/1.1\r\n"
 		"Host: example.com\r\n"
 		"\r\n";
@@ -1461,6 +1460,29 @@ static void test_req_hdr_invalid_req_line_sp(void)
 	r = gwnet_http_req_hdr_parse(&ctx, &hdr);
 	assert(r == -EINVAL);
 	gwnet_http_req_hdr_free(&hdr);
+	gwnet_http_hdr_pctx_free(&ctx);
+	PRTEST_OK();
+}
+
+static void test_req_hdr_invalid_res_status_line_sp(void)
+{
+	// Multiple spaces before the status code is not allowed.
+	static const char buf[] =
+		"HTTP/1.1     200 OK\r\n"
+		"Server: gwhttpd\r\n"
+		"\r\n";
+	static const size_t len = sizeof(buf) - 1;
+	struct gwnet_http_hdr_pctx ctx;
+	struct gwnet_http_res_hdr hdr;
+	int r;
+
+	r = gwnet_http_hdr_pctx_init(&ctx);
+	assert(!r);
+	ctx.buf = buf;
+	ctx.len = len;
+	r = gwnet_http_res_hdr_parse(&ctx, &hdr);
+	assert(r == -EINVAL);
+	gwnet_http_res_hdr_free(&hdr);
 	gwnet_http_hdr_pctx_free(&ctx);
 	PRTEST_OK();
 }
@@ -2573,6 +2595,7 @@ void gwnet_http_run_tests(void)
 		test_req_hdr_query_string();
 		test_req_hdr_query_string_empty();
 		test_req_hdr_invalid_req_line_sp();
+		test_req_hdr_invalid_res_status_line_sp();
 		test_req_hdr_invalid_uri_chars();
 		test_req_hdr_invalid_uri_chars2();
 		test_req_hdr_invalid_method();
