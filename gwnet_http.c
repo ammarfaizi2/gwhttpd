@@ -88,6 +88,7 @@ struct gwnet_http_req {
 	bool				is_chunked;
 	bool				is_body_oversized;
 	bool				keep_alive;
+	bool				is_res_ready;
 	union {
 		struct gwnet_http_hdr_pctx	hpctx;
 		struct gwnet_http_body_pctx	bpctx;
@@ -794,6 +795,7 @@ static int handle_rx_st_done(gwnet_http_cli_t *hc)
 	if (!req->keep_alive)
 		hc->stop_receiving = true;
 
+	req->is_res_ready = true;
 	return r;
 }
 
@@ -1105,11 +1107,15 @@ static int handle_tx(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
 __hot
 static int handle_req_done(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
 {
-	hc->rx_state = GWNET_HTTP_RX_ST_INIT;
-	if (hc->tx_state != GWNET_HTTP_TX_ST_INIT)
-		return 0;
+	struct gwnet_http_req *req = gwnet_http_srv_cli_req_head(hc);
+	int r = 0;
 
-	return handle_tx(hc, c);
+	assert(req);
+	hc->rx_state = GWNET_HTTP_RX_ST_INIT;
+	if (req && req->is_res_ready)
+		r = handle_tx(hc, c);
+
+	return r;
 }
 
 __hot
