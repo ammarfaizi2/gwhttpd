@@ -1060,6 +1060,9 @@ static int __handle_tx(struct gwnet_http_cli *hc, struct gwnet_http_req *req,
 {
 	int r = 0;
 
+	if (!req->is_res_ready)
+		return r;
+
 	switch (hc->tx_state) {
 	case GWNET_HTTP_TX_ST_INIT:
 		r = handle_tx_init(hc, req);
@@ -1107,15 +1110,8 @@ static int handle_tx(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
 __hot
 static int handle_req_done(struct gwnet_http_cli *hc, gwnet_tcp_cli_t *c)
 {
-	struct gwnet_http_req *req = gwnet_http_srv_cli_req_head(hc);
-	int r = 0;
-
-	assert(req);
 	hc->rx_state = GWNET_HTTP_RX_ST_INIT;
-	if (req && req->is_res_ready)
-		r = handle_tx(hc, c);
-
-	return r;
+	return handle_tx(hc, c);
 }
 
 __hot
